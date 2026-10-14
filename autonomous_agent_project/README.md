@@ -17,11 +17,12 @@ autonomous_agent_project/
 ├── core/
 │   ├── agent.py         # Vòng đời agent, Fitness, Tự hủy, Tự nhân bản, GeneticController
 │   ├── strategy.py      # Thị trường, chiến lược, interface thực thi, bộ lọc quy tắc, toán tử gen
-│   └── memory.py        # Reflexion: Post-Mortem, đúc kết quy tắc, ghi JSON atomic
+│   ├── memory.py        # Reflexion: Post-Mortem, đúc kết quy tắc, ghi JSON atomic
+│   └── price_feed.py    # Lấy giá thật từ API công khai Binance (cần requests)
 ├── data/
 │   └── memory_bank.json # Bộ nhớ chung (tự tạo khi chạy, không commit)
 ├── tests/               # Unit test (unittest, tương thích pytest)
-└── requirements.txt     # Rỗng — chỉ dùng thư viện chuẩn
+└── requirements.txt     # requests (chỉ cho price_feed); mô phỏng dùng thư viện chuẩn
 ```
 
 ## Cách chạy nhanh
@@ -212,6 +213,24 @@ Ví dụ một quy tắc trong `memory_bank.json`:
 `os.replace` (atomic). Thao tác được bảo vệ bởi khoá luồng và khoá tệp `fcntl` (trên Linux/macOS), nên
 nhiều tiến trình `main.py` có thể dùng chung một tệp bộ nhớ. Tệp hỏng sẽ được sao lưu thành
 `memory_bank.corrupt.json` và khởi tạo lại.
+
+## Lấy giá thật từ Binance (`core/price_feed.py`)
+
+Module này độc lập với phần mô phỏng, cần `pip install requests` và không cần API key:
+
+```bash
+pip install -r requirements.txt
+python -m core.price_feed            # Giá BTCUSDT hiện tại: 82,030.63
+python -m core.price_feed ETHUSDT
+```
+
+```python
+from core.price_feed import get_latest_price
+price = get_latest_price("BTCUSDT")  # float, hoặc None nếu lỗi
+```
+
+Ở các vùng bị Binance hạn chế, `api.binance.com` trả **HTTP 451**. Khi đó hàm in lý do lỗi rồi tự chuyển
+sang endpoint dữ liệu công khai `data-api.binance.vision`, vốn trả cùng định dạng.
 
 ## Chạy test
 
