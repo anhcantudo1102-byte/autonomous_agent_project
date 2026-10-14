@@ -71,10 +71,12 @@ python main.py --memory /tmp/thi_nghiem.json --reset-memory --tick 0
 | Tham số | Mặc định | Ý nghĩa |
 |---|---|---|
 | `--steps` | 500 | Số tick mô phỏng |
-| `--tick` | 0.05 | Số giây nghỉ giữa hai tick (`0` = nhanh nhất) |
+| `--tick` | 0.05 (2.0 khi `--live-price`) | Số giây nghỉ giữa hai tick (`0` = nhanh nhất) |
+| `--live-price` | tắt | Dùng giá thật từ Binance thay cho thị trường giả lập (lệnh vẫn mô phỏng) |
+| `--symbol` | BTCUSDT | Cặp giao dịch khi bật `--live-price` |
 | `--seed` | ngẫu nhiên | Hạt giống để tái lập kết quả |
 | `--agents` | 5 | Số agent thế hệ 0 |
-| `--max-agents` | 30 | Trần số agent sống cùng lúc (hết chỗ thì hoãn sinh sản) |
+| `--max-agents` / `--population-cap` | 30 | Trần số agent sống cùng lúc (hết chỗ thì hoãn sinh sản) |
 | `--operating-cost` | 0.02 | Chi phí vận hành mỗi tick ($) — agent không làm gì cũng sẽ "chết đói" |
 | `--mutation-rate` | 0.1 | Biên độ đột biến cơ sở (tự co giãn 0.03–0.35 theo áp lực thất bại) |
 | `--fitness-threshold` | 1.5 | Điểm Fitness tối thiểu để được nhân bản |
@@ -216,7 +218,7 @@ nhiều tiến trình `main.py` có thể dùng chung một tệp bộ nhớ. T�
 
 ## Lấy giá thật từ Binance (`core/price_feed.py`)
 
-Module này độc lập với phần mô phỏng, cần `pip install requests` và không cần API key:
+Module cần `pip install requests` và không cần API key. Có thể dùng độc lập:
 
 ```bash
 pip install -r requirements.txt
@@ -232,6 +234,29 @@ price = get_latest_price("BTCUSDT")  # float, hoặc None nếu lỗi
 Ở các vùng bị Binance hạn chế, `api.binance.com` trả **HTTP 451**. Khi đó hàm in lý do lỗi rồi tự chuyển
 sang endpoint dữ liệu công khai `data-api.binance.vision`, vốn trả cùng định dạng.
 
+### Chạy hệ sinh thái trên giá thật (`--live-price`)
+
+```bash
+python main.py --live-price                                  # BTCUSDT, mỗi tick lấy giá mới, nghỉ 2 giây
+python main.py --live-price --symbol ETHUSDT --steps 300 --tick 5
+```
+
+Mỗi tick, `LiveMarketFeed` lấy một giá mới từ Binance rồi tính động lượng và biến động giống hệt thị
+trường giả lập. Nhờ vậy agent, bộ lọc quy tắc, Fitness và GA chạy nguyên vẹn. **Lệnh vẫn chỉ là mô
+phỏng**, không có tiền thật nào được giao dịch.
+
+Cơ chế dự phòng khi API lỗi:
+
+* Không lấy được giá lúc khởi động (mất mạng, sai `--symbol`): in cảnh báo rồi chạy bằng thị trường
+  **giả lập**.
+* Lỗi giữa chừng: tick đó dùng **giá giả lập**, là một bước ngẫu nhiên từ giá cuối theo biến động gần
+  đây. Dòng tóm tắt hiển thị chế độ `Giả lập (API lỗi)`. Khi API hoạt động lại, chương trình tự quay về
+  giá thật.
+
+Lưu ý: giá thật thay đổi rất ít giữa các tick vài giây, thường nhỏ hơn phí giao dịch 0.05% mỗi chiều.
+Agent vì thế chủ yếu đứng ngoài thị trường và chịu chi phí vận hành. Nên dùng `--tick` lớn hơn, ví dụ
+30–60 giây, để mỗi tick có biến động đáng kể.
+
 ## Chạy test
 
 ```bash
@@ -241,7 +266,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-Bộ test (51 ca) bao phủ: Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
+Bộ test (61 ca, không cần mạng) bao phủ: chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
 chống trùng lặp gen và phân hoá ngách (`tests/test_genetics.py`); tự hủy (đúng ngưỡng $0.5, sau lệnh lỗ, chết đói, ngừng hoạt động sau khi chết), nhân
 bản (ngưỡng $40, trích $20, thế hệ/ID cha, đột biến trong biên, thừa kế bộ nhớ, trần quần thể), bộ lọc
 quy tắc (CAM, giảm quy mô, giới hạn đòn bẩy, ưu tiên, quy tắc hết hiệu lực, điều kiện sai định dạng),
