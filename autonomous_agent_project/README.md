@@ -6,7 +6,7 @@ và **tự nhân bản** khi vừa đủ giàu vừa đủ "khoẻ" (điểm Fit
 **Thuật toán Di truyền**: lai ghép từ nhóm tinh hoa, đột biến thích ứng, và kiểm soát đa dạng quần thể. Mọi agent dùng chung một bộ nhớ `data/memory_bank.json`, nên bài học
 xương máu của một agent (kể cả cái chết của nó) trở thành "luật sinh tồn" cho cả hệ sinh thái.
 
-* Chỉ dùng **thư viện chuẩn Python 3.10+** — không cần cài gói, không cần API key.
+* Phần mô phỏng chỉ dùng **thư viện chuẩn Python 3.10+**, không cần API key. Riêng module lấy giá thật từ Binance cần `requests`.
 * Giao dịch **hoàn toàn mô phỏng**; lớp thực thi được tách qua interface để có thể thay bằng sàn thật.
 
 ## Cấu trúc thư mục
