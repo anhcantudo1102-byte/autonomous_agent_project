@@ -1,0 +1,9 @@
+# Bộ nhớ sinh ra khi chạy mô phỏng
+data/*.json
+data/*.lock
+data/.memory_*.tmp
+!data/.gitkeep
+
+__pycache__/
+*.pyc
+.pytest_cache/

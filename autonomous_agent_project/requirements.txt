@@ -1,0 +1,4 @@
+# Dự án chỉ dùng thư viện chuẩn của Python (>= 3.10) — không cần cài thêm gói nào.
+#
+# Tuỳ chọn: nếu muốn chạy test bằng pytest thay cho unittest có sẵn, bỏ dấu # ở dòng dưới.
+# pytest>=7
