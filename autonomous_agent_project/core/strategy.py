@@ -76,7 +76,33 @@ TEN_CHE_DO = {
     "suy_thoai": "Suy thoái",
     "di_ngang": "Đi ngang",
     "hon_loan": "Hỗn loạn",
+    "thuc_te": "Giá thật",
+    "gia_lap_du_phong": "Giả lập (API lỗi)",
 }
+
+
+def build_snapshot(
+    tick: int,
+    prices: Sequence[float],
+    returns: Sequence[float],
+    *,
+    lookback: int,
+    vol_window: int,
+    regime: str,
+) -> MarketSnapshot:
+    """Tính các chỉ báo agent quan sát được từ lịch sử giá (dùng chung cho giá giả lập và giá thật)."""
+    price = prices[-1]
+    window = prices[-lookback:]
+    sma = sum(window) / len(window)
+    vol = statistics.pstdev(returns[-vol_window:]) if len(returns) > 1 else 0.0
+    return MarketSnapshot(
+        tick=tick,
+        price=price,
+        ret_1=returns[-1] if returns else 0.0,
+        momentum=price / sma - 1,
+        volatility=vol,
+        regime=regime,
+    )
 
 
 class MarketSimulator:
@@ -120,15 +146,12 @@ class MarketSimulator:
         del self.returns[:-keep]
 
     def _build_snapshot(self) -> MarketSnapshot:
-        price = self.prices[-1]
-        sma = sum(self.prices[-self.lookback :]) / min(len(self.prices), self.lookback)
-        vol = statistics.pstdev(self.returns[-self.vol_window :]) if len(self.returns) > 1 else 0.0
-        return MarketSnapshot(
-            tick=self.tick,
-            price=price,
-            ret_1=self.returns[-1] if self.returns else 0.0,
-            momentum=price / sma - 1,
-            volatility=vol,
+        return build_snapshot(
+            self.tick,
+            self.prices,
+            self.returns,
+            lookback=self.lookback,
+            vol_window=self.vol_window,
             regime=self.regime,
         )
 
