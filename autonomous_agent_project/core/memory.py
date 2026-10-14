@@ -47,6 +47,7 @@ MIN_LOSSES_CAM = 6
 LOSS_RATE_CAM = 0.65
 SEVERITY_DON_BAY = 0.2
 MIN_SAMPLES_GO_BO = 8
+FAILURE_COUNTER_HORIZON = 200  # số tick giữ lại trong bộ đếm thất bại theo tick
 
 HANH_DONG_CAM = "CAM"
 HANH_DONG_GIAM_QUY_MO = "GIAM_QUY_MO"
@@ -177,6 +178,7 @@ class MemoryBank:
             "cai_chet": [],
             "pha_he": [],
             "thong_ke_tin_hieu": {},
+            "that_bai_theo_tick": {},
         }
 
     def reset(self) -> None:
@@ -255,6 +257,11 @@ class MemoryBank:
 
     def rules(self) -> list[dict[str, Any]]:
         return list(self.load().get("quy_tac", []))
+
+    def recent_failures(self, tick: int, window: int) -> int:
+        """Số lệnh lỗ toàn hệ sinh thái trong ``window`` tick gần nhất (tính cả tick hiện tại)."""
+        counter = self.load().get("that_bai_theo_tick", {})
+        return sum(int(n) for k, n in counter.items() if tick - window < int(k) <= tick)
 
     def summary(self) -> dict[str, int]:
         data = self.load()
@@ -514,6 +521,10 @@ class MemoryBank:
                 }
             )
             del data["that_bai"][: -self.max_failures]
+            counter = data.setdefault("that_bai_theo_tick", {})
+            counter[str(tick)] = int(counter.get(str(tick), 0)) + 1
+            for old in [k for k in counter if int(k) <= tick - FAILURE_COUNTER_HORIZON]:
+                del counter[old]
         return PostMortem(agent_id, tick, sig, loss, severity, lesson, events)
 
     def record_death(
@@ -577,6 +588,7 @@ class MemoryBank:
         generation: int,
         parent_params: dict[str, Any],
         child_params: dict[str, Any],
+        extra: dict[str, Any] | None = None,
     ) -> None:
         with self._transaction() as data:
             data["pha_he"].append(
@@ -587,6 +599,7 @@ class MemoryBank:
                     "the_he": generation,
                     "tham_so_cha": parent_params,
                     "tham_so_con": child_params,
+                    **(extra or {}),
                 }
             )
             del data["pha_he"][: -self.max_births]

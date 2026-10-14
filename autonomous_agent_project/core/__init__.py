@@ -2,11 +2,16 @@
 
 from .agent import (
     DEATH_THRESHOLD,
+    FITNESS_THRESHOLD,
     INITIAL_CAPITAL,
     REPLICATION_COST,
     REPLICATION_THRESHOLD,
     Agent,
     AgentState,
+    BreedResult,
+    FitnessReport,
+    GeneticConfig,
+    GeneticController,
 )
 from .memory import MemoryBank, MemoryView
 from .strategy import (
@@ -20,12 +25,20 @@ from .strategy import (
     SimulatedExecutionEngine,
     StrategyParams,
     TradingStrategy,
+    adaptive_mutation_rate,
+    diversify,
+    population_diversity,
 )
 
 __all__ = [
     "Agent",
     "AgentState",
+    "BreedResult",
     "DEATH_THRESHOLD",
+    "FITNESS_THRESHOLD",
+    "FitnessReport",
+    "GeneticConfig",
+    "GeneticController",
     "Direction",
     "ExecutionEngine",
     "INITIAL_CAPITAL",
@@ -41,4 +54,7 @@ __all__ = [
     "SimulatedExecutionEngine",
     "StrategyParams",
     "TradingStrategy",
+    "adaptive_mutation_rate",
+    "diversify",
+    "population_diversity",
 ]

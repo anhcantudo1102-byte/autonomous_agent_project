@@ -8,6 +8,9 @@ Thiết kế tách lớp:
 * ``RuleFilter``           – áp quy tắc sinh tồn đọc từ bộ nhớ chung lên lệnh đề xuất.
 * ``TradingStrategy``      – sinh lệnh theo động lượng từ bộ gen ``StrategyParams``;
   từ chối ra quyết định nếu không được cung cấp ảnh chụp bộ nhớ mới đọc ở đúng tick.
+* Toán tử di truyền trên bộ gen: lai ghép (``StrategyParams.crossover``), đột biến
+  (``mutate``), đột biến thích ứng (``adaptive_mutation_rate``), đo khoảng cách gen và
+  chống trùng lặp bộ gen (``diversify``).
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ import statistics
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Sequence
 
 from .memory import (
     HANH_DONG_CAM,
@@ -179,12 +182,117 @@ class StrategyParams:
         values["contrarian"] = (not self.contrarian) if rng.random() < flip_prob else self.contrarian
         return StrategyParams(**values)
 
+    @classmethod
+    def crossover(
+        cls,
+        parents: Sequence["StrategyParams"],
+        rng: random.Random,
+        weights: Sequence[float] | None = None,
+    ) -> "StrategyParams":
+        """Lai ghép đồng nhất: mỗi gen lấy từ một cha/mẹ, chọn ngẫu nhiên theo trọng số Fitness."""
+        if not parents:
+            raise ValueError("Cần ít nhất một bộ gen để lai ghép")
+        if weights is None or sum(max(0.0, w) for w in weights) <= 0:
+            weights = [1.0] * len(parents)
+        weights = [max(0.0, w) for w in weights]
+        values = {
+            name: getattr(rng.choices(parents, weights=weights, k=1)[0], name)
+            for name in (*PARAM_BOUNDS, "contrarian")
+        }
+        return cls(**values)
+
+    def genome(self) -> tuple[float, ...]:
+        """Bộ gen chuẩn hoá về [0, 1] để đo khoảng cách giữa các chiến lược."""
+        vec = [(getattr(self, n) - lo) / (hi - lo) for n, (lo, hi) in PARAM_BOUNDS.items()]
+        vec.append(1.0 if self.contrarian else 0.0)
+        return tuple(min(1.0, max(0.0, v)) for v in vec)
+
+    def distance(self, other: "StrategyParams") -> float:
+        """Khoảng cách Euclid chuẩn hoá trong [0, 1]; 0 nghĩa là hai bộ gen trùng hệt."""
+        a, b = self.genome(), other.genome()
+        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)) / len(a))
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StrategyParams":
         return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
+
+
+def nearest_distance(candidate: StrategyParams, population: Iterable[StrategyParams]) -> float:
+    """Khoảng cách tới bộ gen gần nhất trong quần thể (1.0 nếu quần thể rỗng)."""
+    return min((candidate.distance(p) for p in population), default=1.0)
+
+
+def population_diversity(population: Sequence[StrategyParams]) -> float:
+    """Độ đa dạng quần thể = khoảng cách trung bình giữa mọi cặp bộ gen."""
+    pairs = [(a, b) for i, a in enumerate(population) for b in population[i + 1 :]]
+    if not pairs:
+        return 0.0
+    return sum(a.distance(b) for a, b in pairs) / len(pairs)
+
+
+def adaptive_mutation_rate(
+    failure_pressure: float,
+    *,
+    base_rate: float = 0.1,
+    min_rate: float = 0.03,
+    max_rate: float = 0.35,
+    high_pressure: float = 0.4,
+) -> float:
+    """Biên độ đột biến thích ứng theo áp lực thất bại (số lệnh lỗ / agent / tick).
+
+    Áp lực 0 → ``min_rate`` (tinh chỉnh chiến lược đang tốt); áp lực bằng một nửa
+    ``high_pressure`` → ``base_rate``; áp lực ≥ ``high_pressure`` → ``max_rate``
+    (mở rộng tìm kiếm chiến lược mới). Nội suy tuyến tính giữa các mốc.
+    """
+    x = min(1.0, max(0.0, failure_pressure / high_pressure)) if high_pressure > 0 else 1.0
+    if x <= 0.5:
+        return min_rate + (base_rate - min_rate) * (x / 0.5)
+    return base_rate + (max_rate - base_rate) * ((x - 0.5) / 0.5)
+
+
+@dataclass(frozen=True)
+class DiversityResult:
+    params: StrategyParams
+    nearest: float
+    attempts: int
+    immigrant: bool
+
+
+def diversify(
+    candidate: StrategyParams,
+    population: Sequence[StrategyParams],
+    rng: random.Random,
+    *,
+    min_distance: float,
+    rate: float,
+    max_attempts: int = 6,
+) -> DiversityResult:
+    """Chống đồng huyết thống: đột biến lại (biên độ tăng dần) tới khi đủ khác quần thể.
+
+    Nếu sau ``max_attempts`` lần vẫn trùng lặp, thay một nửa số gen bằng gen ngẫu nhiên
+    ("gen nhập cư") để mở ra một ngách chiến lược mới.
+    """
+    params = candidate
+    nearest = nearest_distance(params, population)
+    attempts = 0
+    current_rate = max(rate, 0.05)
+    while nearest < min_distance and attempts < max_attempts:
+        attempts += 1
+        params = params.mutate(rng, rate=current_rate)
+        nearest = nearest_distance(params, population)
+        current_rate = min(1.0, current_rate * 1.5)
+    if nearest >= min_distance:
+        return DiversityResult(params, nearest, attempts, immigrant=False)
+    stranger = StrategyParams.random(rng)
+    names = list(PARAM_BOUNDS)
+    swapped = set(rng.sample(names, k=max(1, len(names) // 2)))
+    values = {n: getattr(stranger if n in swapped else params, n) for n in names}
+    values["contrarian"] = stranger.contrarian if rng.random() < 0.5 else params.contrarian
+    params = StrategyParams(**values)
+    return DiversityResult(params, nearest_distance(params, population), attempts, immigrant=True)
 
 
 # ======================================================================

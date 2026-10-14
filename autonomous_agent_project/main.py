@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from core.agent import INITIAL_CAPITAL, Agent
+from core.agent import FITNESS_THRESHOLD, INITIAL_CAPITAL, Agent, GeneticConfig, GeneticController
 from core.memory import MemoryBank
 from core.strategy import TEN_CHE_DO, MarketSimulator, SimulatedExecutionEngine, StrategyParams
 
@@ -40,7 +40,19 @@ class Ecosystem:
         self._ids = itertools.count(1)
         self.agents: list[Agent] = []
         self.graveyard: list[Agent] = []
+        self._newborns: list[Agent] = []
         self._stop = False
+        self.genetics = GeneticController(
+            self.memory,
+            lambda: [*self.agents, *self._newborns],
+            random.Random(self.rng.random()),
+            GeneticConfig(
+                elite_size=args.elite_size,
+                crossover_prob=args.crossover_prob,
+                base_mutation_rate=args.mutation_rate,
+                min_genome_distance=args.min_diversity,
+            ),
+        )
         for _ in range(args.agents):
             self.agents.append(self._spawn_genesis())
 
@@ -57,6 +69,7 @@ class Ecosystem:
             rng=random.Random(self.rng.random()),
             operating_cost=self.args.operating_cost,
             mutation_rate=self.args.mutation_rate,
+            fitness_threshold=self.args.fitness_threshold,
         )
         p = agent.params
         log.info(
@@ -90,15 +103,18 @@ class Ecosystem:
             if self._stop:
                 break
             snap = self.market.step()
-            newborns: list[Agent] = []
+            newborns = self._newborns = []
             for agent in list(self.agents):
                 room = len(self.agents) + len(newborns) < a.max_agents
-                newborns += agent.step(snap, id_factory=self.next_id, can_replicate=room)
+                newborns += agent.step(snap, id_factory=self.next_id, can_replicate=room, genetics=self.genetics)
                 if not agent.is_alive:
                     # Agent đã tự hủy: rút khỏi bộ lập lịch, "tiến trình" của nó kết thúc.
                     self.agents.remove(agent)
                     self.graveyard.append(agent)
             self.agents.extend(newborns)
+            self._newborns = []
+            if a.diversity_every > 0 and step % a.diversity_every == 0:
+                self.genetics.enforce_diversity(step)
 
             if step % a.summary_every == 0 or step == a.steps:
                 self._print_status(step, snap)
@@ -117,31 +133,36 @@ class Ecosystem:
         total = sum(ag.total_assets(snap) for ag in self.agents)
         mem = self.memory.summary()
         gens = max((ag.generation for ag in self.agents), default=0)
+        best = max((ag.fitness().score for ag in self.agents), default=0.0)
         log.info(
             "📊 Tick %4d | giá %8.2f | chế độ %-11s | sống %2d, chết %2d | tổng vốn $%7.2f | "
-            "thế hệ cao nhất %d | quy tắc %d (%d hiệu lực)",
+            "thế hệ cao nhất %d | quy tắc %d (%d hiệu lực) | Fitness tốt nhất %.2f | đa dạng gen %.3f | "
+            "biên độ đột biến %.2f",
             step, snap.price, TEN_CHE_DO[snap.regime], len(self.agents), len(self.graveyard),
-            total, gens, mem["quy_tac"], mem["quy_tac_hieu_luc"],
+            total, gens, mem["quy_tac"], mem["quy_tac_hieu_luc"], best, self.genetics.diversity(),
+            self.genetics.mutation_rate(step),
         )
 
     def _print_report(self, step: int) -> None:
         everyone = sorted(self.agents + self.graveyard, key=lambda ag: ag.agent_id)
         print()
-        print("=" * 96)
+        width = 112
+        print("=" * width)
         print(f" BÁO CÁO CUỐI CÙNG sau {step} tick")
-        print("=" * 96)
-        print(f" {'ID':<6} {'Thế hệ':>6} {'Cha':<6} {'Trạng thái':<11} {'Vốn':>9} {'Lệnh':>5} "
-              f"{'Thắng':>5} {'Thua':>5} {'Bị chặn':>7} {'Điều chỉnh':>10} {'Con':>4}")
-        print("-" * 96)
+        print("=" * width)
+        print(f" {'ID':<6} {'Thế hệ':>6} {'Cha':<6} {'Trạng thái':<11} {'Vốn':>9} {'Fitness':>8} "
+              f"{'Max DD':>7} {'Lệnh':>5} {'Thắng':>5} {'Thua':>5} {'Bị chặn':>7} {'Điều chỉnh':>10} {'Con':>4}")
+        print("-" * width)
         for ag in everyone:
             s = ag.stats
             print(f" {ag.agent_id:<6} {ag.generation:>6} {ag.parent_id or '-':<6} {ag.state.value:<11} "
-                  f"${ag.capital:>8.2f} {s.trades:>5} {s.wins:>5} {s.losses:>5} {s.blocked:>7} "
-                  f"{s.adjusted:>10} {s.children:>4}")
-        print("-" * 96)
+                  f"${ag.capital:>8.2f} {ag.fitness().score:>8.2f} {s.max_drawdown:>7.0%} {s.trades:>5} "
+                  f"{s.wins:>5} {s.losses:>5} {s.blocked:>7} {s.adjusted:>10} {s.children:>4}")
+        print("-" * width)
         mem = self.memory.summary()
         print(f" Sống: {len(self.agents)} | Đã chết: {len(self.graveyard)} | "
-              f"Tổng vốn còn lại: ${sum(ag.capital for ag in self.agents):.2f}")
+              f"Tổng vốn còn lại: ${sum(ag.capital for ag in self.agents):.2f} | "
+              f"Đa dạng gen: {self.genetics.diversity():.3f}")
         print(f" Bộ nhớ chung ({self.args.memory}): {mem['quy_tac']} quy tắc "
               f"({mem['quy_tac_hieu_luc']} hiệu lực), {mem['that_bai']} hồ sơ thất bại, "
               f"{mem['cai_chet']} hồ sơ cái chết, {mem['pha_he']} sự kiện sinh sản.")
@@ -150,7 +171,7 @@ class Ecosystem:
             print(" Một số quy tắc sinh tồn đang hiệu lực:")
             for r in rules[-5:]:
                 print(f"   • {r['id']} [{r['hanh_dong']}] {r['mo_ta']}")
-        print("=" * 96)
+        print("=" * width)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -164,7 +185,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--agents", type=int, default=5, help="Số agent khởi sinh (thế hệ 0)")
     p.add_argument("--max-agents", type=int, default=30, help="Giới hạn số agent sống cùng lúc")
     p.add_argument("--operating-cost", type=float, default=0.02, help="Chi phí vận hành mỗi tick ($)")
-    p.add_argument("--mutation-rate", type=float, default=0.1, help="Độ lớn đột biến gen khi nhân bản")
+    p.add_argument("--mutation-rate", type=float, default=0.1,
+                   help="Biên độ đột biến cơ sở; thực tế tự co giãn theo áp lực thất bại trong bộ nhớ")
+    p.add_argument("--fitness-threshold", type=float, default=FITNESS_THRESHOLD,
+                   help="Điểm Fitness tối thiểu để được phép tự nhân bản")
+    p.add_argument("--elite-size", type=int, default=3, help="Số agent Fitness cao nhất tham gia lai ghép")
+    p.add_argument("--crossover-prob", type=float, default=0.7, help="Xác suất lai ghép thay vì tự đột biến")
+    p.add_argument("--min-diversity", type=float, default=0.05,
+                   help="Khoảng cách gen tối thiểu giữa hai agent (chống đồng huyết thống)")
+    p.add_argument("--diversity-every", type=int, default=25,
+                   help="Rà soát trùng lặp gen sau mỗi N tick (0 = tắt)")
     p.add_argument("--summary-every", type=int, default=25, help="In tóm tắt sau mỗi N tick")
     p.add_argument("--memory", type=Path, default=DEFAULT_MEMORY, help="Đường dẫn tệp bộ nhớ chung")
     p.add_argument("--reset-memory", action="store_true", help="Xoá sạch bộ nhớ trước khi chạy")
@@ -175,6 +205,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if args.steps <= 0 or args.agents <= 0 or args.max_agents < args.agents or args.summary_every <= 0:
         p.error("Tham số không hợp lệ: cần steps > 0, agents > 0, summary-every > 0 và max-agents ≥ agents")
+    if args.elite_size < 1 or not 0 <= args.crossover_prob <= 1 or args.min_diversity < 0 or args.diversity_every < 0:
+        p.error("Tham số di truyền không hợp lệ: elite-size ≥ 1, 0 ≤ crossover-prob ≤ 1, "
+                "min-diversity ≥ 0, diversity-every ≥ 0")
     return args
 
 
