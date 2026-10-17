@@ -19,6 +19,7 @@ autonomous_agent_project/
 │   ├── strategy.py      # Thị trường, chiến lược, interface thực thi, bộ lọc quy tắc, toán tử gen
 │   ├── memory.py        # Reflexion: Post-Mortem, đúc kết quy tắc, ghi JSON atomic
 │   ├── price_feed.py    # Lấy giá/nến thật từ API công khai Binance (cần requests)
+│   ├── history.py       # Nến lịch sử cho --backtest: tải phân trang, zip data.binance.vision, cache CSV
 │   ├── advanced_strategy.py # MultiDimensionalAnalyzer, AdvancedMarketAnalyzer (BOS/CHoCH/OB), ConfluenceFeed
 │   ├── evolution.py     # calculate_advanced_fitness: Fitness thưởng/phạt kỷ luật theo điểm hợp lưu
 │   ├── checkpoint.py    # Lưu/khôi phục checkpoint quần thể (atomic, có schema_version)
@@ -26,8 +27,10 @@ autonomous_agent_project/
 ├── advanced_demo.py     # Demo phân tích đa khung thời gian (nến giả lập hoặc --live)
 ├── evolution_demo.py    # Demo tiến hoá: chạy lại là tiếp tục từ thế hệ đã lưu
 ├── dashboard_demo.py    # Demo dashboard với dữ liệu giả
+├── scripts/             # backtest_compare.py (ma trận backtest), plot_backtest.py (biểu đồ, cần matplotlib)
 ├── data/
-│   └── memory_bank.json # Bộ nhớ chung (tự tạo khi chạy, không commit)
+│   ├── memory_bank.json # Bộ nhớ chung (tự tạo khi chạy, không commit)
+│   └── history/         # Cache nến lịch sử của --backtest (không commit)
 ├── checkpoints/         # Checkpoint quần thể (tự tạo khi bật checkpoint, không commit)
 ├── tests/               # Unit test (unittest, tương thích pytest)
 └── requirements.txt     # requests (price_feed), rich (dashboard, tuỳ chọn); mô phỏng dùng thư viện chuẩn
@@ -78,10 +81,10 @@ python main.py --memory /tmp/thi_nghiem.json --reset-memory --tick 0
 
 | Tham số | Mặc định | Ý nghĩa |
 |---|---|---|
-| `--steps` | 500 | Số tick mô phỏng |
-| `--tick` | 0.05 (2.0 khi `--live-price`) | Số giây nghỉ giữa hai tick (`0` = nhanh nhất) |
+| `--steps` | 500 (hết số nến khi `--backtest`) | Số tick mô phỏng |
+| `--tick` | 0.05 (2.0 khi `--live-price`, 0 khi `--backtest`) | Số giây nghỉ giữa hai tick (`0` = nhanh nhất) |
 | `--live-price` | tắt | Dùng giá thật từ Binance thay cho thị trường giả lập (lệnh vẫn mô phỏng) |
-| `--symbol` | BTCUSDT | Cặp giao dịch khi bật `--live-price` |
+| `--symbol` | BTCUSDT | Cặp giao dịch khi bật `--live-price` hoặc `--backtest` |
 | `--seed` | ngẫu nhiên | Hạt giống để tái lập kết quả |
 | `--agents` | 5 | Số agent thế hệ 0 |
 | `--max-agents` / `--population-cap` | 30 | Trần số agent sống cùng lúc (hết chỗ thì hoãn sinh sản) |
@@ -103,6 +106,12 @@ python main.py --memory /tmp/thi_nghiem.json --reset-memory --tick 0
 | `--advanced-analysis` | tắt | Bật bộ lọc hợp lưu đa khung (SMC/Order Block/Hidden Base/Elliott) và gen tin tưởng `confluence_weight` |
 | `--htf-ticks` / `--ltf-ticks` | 8 / 2 | Số tick gom thành một nến HTF / LTF |
 | `--htf-interval` / `--ltf-interval` | 1h / 1m | Khung nến Binance khi dùng cùng `--live-price` |
+| `--backtest` | tắt | Chạy trên nến lịch sử thật của Binance (một nến = một tick, cache `data/history/`) |
+| `--interval` | 1h | Khung nến lịch sử |
+| `--start` / `--end` / `--days` | 180 ngày tới hôm qua | Khoảng ngày UTC của backtest (`--end` tính cả ngày cuối) |
+| `--history-file` | — | Dùng CSV nến có sẵn thay vì tải |
+| `--history-dir` | `data/history` | Thư mục cache nến |
+| `--equity-csv` / `--summary-json` | — | Ghi đường vốn theo tick / tóm tắt kết quả backtest |
 | `--no-fsync` | tắt | Bỏ `fsync` khi ghi để chạy nhanh hơn (vẫn atomic nhờ `os.replace`) |
 | `-v` / `-q` | | Chi tiết hơn / chỉ cảnh báo |
 
@@ -585,6 +594,48 @@ Kết luận trung thực:
   (+$370); bỏ seed này thì production kém hơn khoảng 10%.
 * **Chưa đủ bằng chứng.** Số liệu chưa cho thấy production tốt hơn. Cả hai biến thể đều kém chế độ mặc định ở 500 tick.
 
+## Backtest trên nến lịch sử thật (`--backtest`, `core/history.py`)
+
+Chạy hệ sinh thái trên nến lịch sử thật của Binance. Một nến là một tick, giá của tick là giá đóng cửa. Không nghỉ giữa
+các tick. Mặc định chạy hết số nến (`--steps` giới hạn bớt nếu muốn).
+
+```bash
+python main.py --backtest --symbol BTCUSDT --interval 1h --start 2024-01-01 --end 2024-06-30 --seed 7
+python main.py --backtest --symbol ETHUSDT --interval 4h --days 365 --advanced-analysis
+python main.py --backtest --history-file nen_cua_toi.csv --equity-csv results/von.csv --summary-json results/ket_qua.json
+```
+
+* **Nguồn dữ liệu.** Thử `/api/v3/klines` của `api.binance.com` rồi `data-api.binance.vision`, phân trang theo
+  `startTime`, 1000 nến mỗi lần. Nếu REST bị chặn hết thì tải zip hàng tháng của `data.binance.vision`. Tệp từ 2025 ghi
+  thời gian theo micro giây, được đổi về mili giây.
+* **Cache.** Lưu ở `data/history/<CẶP>-<khung>-<từ>-<đến>.csv` (gitignore, `--history-dir` để đổi). Lần sau chạy
+  offline.
+* **`--history-file`.** Đọc CSV có sẵn: có hoặc không có tiêu đề, cột `open_time,open,high,low,close[,volume]`, nhận
+  cả CSV 12 cột gốc của Binance.
+* **Ngày.** `--start`/`--end` theo UTC, tính cả ngày cuối. `--end` mặc định hôm qua. `--days N` lấy N ngày kết thúc
+  ở `--end`. Không có `--start` lẫn `--days` thì lấy 180 ngày.
+* **Không nhìn trước tương lai.** 13 nến đầu chỉ dùng khởi động chỉ báo. Snapshot tick t chỉ dùng nến tới t. Với
+  `--advanced-analysis`, HTF/LTF gộp từ chính nến lịch sử thật (open/high/low/close thật): `--htf-ticks 8` trên nến
+  1h là nến 8h. Test chạy cùng seed trên chuỗi đầy đủ và chuỗi bị cắt, kết quả phải giống hệt.
+* **Báo cáo.** Có thêm tổng vốn hệ sinh thái (agent chết giữ vốn còn lại; diệt vong thì vốn đứng yên tới hết giai
+  đoạn), Max DD của đường vốn hệ sinh thái và mốc Buy & Hold cùng giai đoạn, cùng vốn ban đầu.
+* **Hiệu năng.** Khi backtest, bộ nhớ chung ghi JSON gọn và không fsync. Sáu tháng nến 1h mất khoảng 10–40 giây.
+* **Checkpoint.** `--resume` hoạt động với loại thị trường `history`. Checkpoint của chuỗi nến khác thì khởi tạo mới.
+
+`scripts/backtest_compare.py` chạy ma trận cặp × giai đoạn × cấu hình × seed song song.
+`scripts/plot_backtest.py` vẽ đường vốn (cần matplotlib, không bắt buộc).
+
+**Kết quả đã đo** (BTC/ETH/SOL, nến 1h, ba giai đoạn tăng/giảm/đi ngang 6 tháng, 5 seed, 405 lần chạy):
+* Không lần nào có lãi.
+* Với chi phí vận hành mặc định $0.02/tick, mọi lần chạy đều diệt vong quanh tick 900. Mức phí này hiệu chỉnh cho mô
+  phỏng 500 tick.
+* Bỏ chi phí vận hành, vốn trung bình còn $44.50 (mặc định) và $51.75 (`--advanced-analysis`), so với Buy & Hold
+  $189.27.
+* Không agent nào đạt ngưỡng nhân bản $40, nên `--elite-fitness agent` và `production` cho kết quả giống hệt nhau.
+
+Bảng chi tiết, phân tích nguyên nhân và lệnh tái lập nằm trong báo cáo backtest lịch sử (`docs/backtest-lich-su.md`
+trong kho tài liệu của dự án).
+
 ## Chạy test
 
 ```bash
@@ -594,7 +645,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-Bộ test (229 ca, không cần mạng, không cần TTY) bao phủ: `calculate_advanced_fitness` (4 test gốc của người dùng và các ca biên) và `calculate_advanced_fitness_scaled` (giá trị cụ thể cho từng nhánh, khớp bản gốc trên dữ liệu hợp lệ) và `calculate_production_fitness` (Max DD, phân hoá agent cháy tài khoản, hoà vốn = đứng ngoài, `other_costs`), lịch sử lệnh, `Agent.production_fitness()`, tinh hoa theo `--elite-fitness` (`tests/test_genetics.py`, `tests/test_advanced_integration.py`), 100% dòng và nhánh của `core/evolution.py` (`tests/test_evolution.py`); `AdvancedMarketAnalyzer` (3 test gốc của người dùng, BOS/CHoCH, Order Block, Hidden Base, sóng, hệ số ×1.5 theo chiều), `CandleBuilder`, `ConfluenceFeed` với nến Binance được mock, gen `confluence_weight` (phủ quyết, tăng/giảm tỷ trọng, quy tắc CẤM vẫn chặn) và `--advanced-analysis` trong `main.py` (mặc định tắt, resume tất định, dashboard) (`tests/test_advanced_strategy.py`, `tests/test_strategy.py`, `tests/test_advanced_integration.py`); giá khởi điểm dự phòng theo cặp và tính độc lập với thang giá (`tests/test_fallback_price.py`); `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
+Bộ test (268 ca, không cần mạng, không cần TTY) bao phủ: chế độ backtest (CSV mẫu 200 nến BTCUSDT thật trong `tests/data/`, phân trang klines và chuyển endpoint khi bị chặn với HTTP giả, zip hàng tháng có thời gian micro giây, cache dùng lại offline, `HistoricalMarket`, Buy & Hold, không nhìn trước tương lai, resume tất định, 99% nhánh của `core/history.py`) (`tests/test_history.py`); `calculate_advanced_fitness` (4 test gốc của người dùng và các ca biên) và `calculate_advanced_fitness_scaled` (giá trị cụ thể cho từng nhánh, khớp bản gốc trên dữ liệu hợp lệ) và `calculate_production_fitness` (Max DD, phân hoá agent cháy tài khoản, hoà vốn = đứng ngoài, `other_costs`), lịch sử lệnh, `Agent.production_fitness()`, tinh hoa theo `--elite-fitness` (`tests/test_genetics.py`, `tests/test_advanced_integration.py`), 100% dòng và nhánh của `core/evolution.py` (`tests/test_evolution.py`); `AdvancedMarketAnalyzer` (3 test gốc của người dùng, BOS/CHoCH, Order Block, Hidden Base, sóng, hệ số ×1.5 theo chiều), `CandleBuilder`, `ConfluenceFeed` với nến Binance được mock, gen `confluence_weight` (phủ quyết, tăng/giảm tỷ trọng, quy tắc CẤM vẫn chặn) và `--advanced-analysis` trong `main.py` (mặc định tắt, resume tất định, dashboard) (`tests/test_advanced_strategy.py`, `tests/test_strategy.py`, `tests/test_advanced_integration.py`); giá khởi điểm dự phòng theo cặp và tính độc lập với thang giá (`tests/test_fallback_price.py`); `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
 chống trùng lặp gen và phân hoá ngách (`tests/test_genetics.py`); tự hủy (đúng ngưỡng $0.5, sau lệnh lỗ, chết đói, ngừng hoạt động sau khi chết), nhân
 bản (ngưỡng $40, trích $20, thế hệ/ID cha, đột biến trong biên, thừa kế bộ nhớ, trần quần thể), bộ lọc
 quy tắc (CAM, giảm quy mô, giới hạn đòn bẩy, ưu tiên, quy tắc hết hiệu lực, điều kiện sai định dạng),
