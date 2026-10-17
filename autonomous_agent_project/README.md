@@ -20,6 +20,7 @@ autonomous_agent_project/
 │   ├── memory.py        # Reflexion: Post-Mortem, đúc kết quy tắc, ghi JSON atomic
 │   ├── price_feed.py    # Lấy giá/nến thật từ API công khai Binance (cần requests)
 │   ├── advanced_strategy.py # MultiDimensionalAnalyzer, AdvancedMarketAnalyzer (BOS/CHoCH/OB), ConfluenceFeed
+│   ├── evolution.py     # calculate_advanced_fitness: Fitness thưởng/phạt kỷ luật theo điểm hợp lưu
 │   ├── checkpoint.py    # Lưu/khôi phục checkpoint quần thể (atomic, có schema_version)
 │   └── dashboard.py     # Dashboard terminal bằng rich (tuỳ chọn): quần thể, sự kiện, di truyền
 ├── advanced_demo.py     # Demo phân tích đa khung thời gian (nến giả lập hoặc --live)
@@ -476,6 +477,30 @@ Kết luận trung thực: **bật cờ không giúp hệ sinh thái tốt hơn 
   nhiều thông tin dự báo.
 * Gen tin tưởng trung bình cuối kỳ dao động 0.29–0.67 và chưa hội tụ trong 500 tick.
 
+### Fitness nâng cao (`core/evolution.py`)
+
+`calculate_advanced_fitness(agent, trades)` chấm điểm một chuỗi lệnh. Mỗi lệnh có dạng `{"pnl", "action", "confluence_score"}`.
+Hàm này **chưa** được GA hay `main.py` dùng; GA vẫn dùng `Agent.fitness()`.
+
+Điểm = tổng pnl, cộng/trừ theo từng lệnh:
+* Lệnh thuận chiều điểm (mua khi điểm > 0, bán khi điểm < 0): thưởng |điểm| × 10.
+* Lệnh ngược chiều khi tín hiệu rõ: phạt 20.
+* Lệnh trong vùng nhiễu (|điểm| < 0.5): phạt 5. Nhiễu được xét trước chiều lệnh.
+* Kết quả không thấp hơn sàn 0.1.
+
+Mọi hằng số đều truyền được qua tham số (`bonus_per_point`, `counter_penalty`, `noise_penalty`,
+`noise_threshold`, `floor`).
+
+Cách xử lý các trường hợp đặc biệt (chi tiết trong docstring):
+* HOLD, hành động lạ hoặc thiếu điểm: chỉ cộng pnl.
+* Không có lệnh: trả về 0.1.
+* Giá trị không phải số, NaN hoặc vô cực: `ValueError`.
+
+```python
+from core.evolution import calculate_advanced_fitness
+calculate_advanced_fitness(agent, [{"pnl": 50.0, "action": "BUY", "confluence_score": 3.0}])  # 80.0
+```
+
 ## Chạy test
 
 ```bash
@@ -485,7 +510,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-Bộ test (175 ca, không cần mạng, không cần TTY) bao phủ: `AdvancedMarketAnalyzer` (3 test gốc của người dùng, BOS/CHoCH, Order Block, Hidden Base, sóng, hệ số ×1.5 theo chiều), `CandleBuilder`, `ConfluenceFeed` với nến Binance được mock, gen `confluence_weight` (phủ quyết, tăng/giảm tỷ trọng, quy tắc CẤM vẫn chặn) và `--advanced-analysis` trong `main.py` (mặc định tắt, resume tất định, dashboard) (`tests/test_advanced_strategy.py`, `tests/test_strategy.py`, `tests/test_advanced_integration.py`); giá khởi điểm dự phòng theo cặp và tính độc lập với thang giá (`tests/test_fallback_price.py`); `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
+Bộ test (191 ca, không cần mạng, không cần TTY) bao phủ: `calculate_advanced_fitness` (4 test gốc của người dùng và các ca biên, 100% dòng và nhánh của `core/evolution.py`) (`tests/test_evolution.py`); `AdvancedMarketAnalyzer` (3 test gốc của người dùng, BOS/CHoCH, Order Block, Hidden Base, sóng, hệ số ×1.5 theo chiều), `CandleBuilder`, `ConfluenceFeed` với nến Binance được mock, gen `confluence_weight` (phủ quyết, tăng/giảm tỷ trọng, quy tắc CẤM vẫn chặn) và `--advanced-analysis` trong `main.py` (mặc định tắt, resume tất định, dashboard) (`tests/test_advanced_strategy.py`, `tests/test_strategy.py`, `tests/test_advanced_integration.py`); giá khởi điểm dự phòng theo cặp và tính độc lập với thang giá (`tests/test_fallback_price.py`); `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
 chống trùng lặp gen và phân hoá ngách (`tests/test_genetics.py`); tự hủy (đúng ngưỡng $0.5, sau lệnh lỗ, chết đói, ngừng hoạt động sau khi chết), nhân
 bản (ngưỡng $40, trích $20, thế hệ/ID cha, đột biến trong biên, thừa kế bộ nhớ, trần quần thể), bộ lọc
 quy tắc (CAM, giảm quy mô, giới hạn đòn bẩy, ưu tiên, quy tắc hết hiệu lực, điều kiện sai định dạng),
