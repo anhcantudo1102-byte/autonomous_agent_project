@@ -7,6 +7,7 @@ Ví dụ:
     python main.py --steps 200 --checkpoint-every 50           # lưu checkpoint mỗi 50 tick và khi Ctrl+C
     python main.py --steps 200 --resume                        # chạy tiếp 200 tick từ checkpoint
     python main.py --dashboard --tick 0.1                      # dashboard trực quan (cần rich)
+    python main.py --live-dashboard                            # giá thật + dashboard, 30 bước, tick 2 giây
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from core.strategy import TEN_CHE_DO, MarketSimulator, SimulatedExecutionEngine,
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_MEMORY = PROJECT_DIR / "data" / "memory_bank.json"
 DEFAULT_CHECKPOINT = ckpt.CHECKPOINT_DIR / "ecosystem_checkpoint.json"
+LIVE_DASHBOARD_DEFAULTS = {"live_price": True, "dashboard": True, "steps": 30, "tick": 2.0, "symbol": "BTCUSDT"}
 CHECKPOINT_FIELDS = ("tick", "next_id", "rng", "market", "agents", "graveyard")
 DEFAULT_TICK_SIMULATED = 0.05
 DEFAULT_TICK_LIVE = 2.0
@@ -405,7 +407,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     verbosity = p.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true", help="In chi tiết từng lệnh/Post-Mortem")
     verbosity.add_argument("-q", "--quiet", action="store_true", help="Chỉ in cảnh báo và báo cáo cuối")
+    p.add_argument("--live-dashboard", action="store_true",
+                   help="Viết tắt của --live-price --dashboard --steps 30 --tick 2 (các cờ ghi rõ vẫn được ưu tiên)")
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if "--live-dashboard" in argv:
+        p.set_defaults(**LIVE_DASHBOARD_DEFAULTS)
     args = p.parse_args(argv)
+    if args.live_dashboard:
+        args.live_price = args.dashboard = True
     if args.tick is None:
         args.tick = DEFAULT_TICK_LIVE if args.live_price else DEFAULT_TICK_SIMULATED
     if args.steps <= 0 or args.agents <= 0 or args.max_agents < args.agents or args.summary_every <= 0:
@@ -427,8 +436,36 @@ def main(argv: list[str] | None = None) -> int:
     level = logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s %(name)-14s %(message)s", datefmt="%H:%M:%S")
     eco = Ecosystem(args)
-    signal.signal(signal.SIGINT, eco.request_stop)
-    return eco.run()
+    previous = signal.signal(signal.SIGINT, eco.request_stop)
+    try:
+        return eco.run()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def kwargs_to_argv(options: dict[str, Any]) -> list[str]:
+    """``{"seed": 7, "reset_memory": True}`` → ``["--seed", "7", "--reset-memory"]`` (False/None bị bỏ qua)."""
+    argv: list[str] = []
+    for key, value in options.items():
+        flag = "--" + key.replace("_", "-")
+        if value is True:
+            argv.append(flag)
+        elif value is not False and value is not None:
+            argv += [flag, str(value)]
+    return argv
+
+
+def run_simulation_with_dashboard(
+    symbol: str = "BTCUSDT", steps: int = 50, tick_interval: float = 2, **kwargs: Any
+) -> int:
+    """Chạy mô phỏng THẬT trên giá Binance kèm dashboard; trả về mã thoát như ``main()``.
+
+    Quần thể, agent tốt nhất, thế hệ… lấy từ hệ sinh thái thật. Không lấy được giá lúc khởi động
+    thì dùng thị trường giả lập; thiếu rich hoặc không phải terminal thì dùng log thường.
+    ``kwargs`` là các tham số CLI khác viết kiểu Python, ví dụ ``seed=7, checkpoint_every=10``.
+    """
+    argv = ["--live-price", "--dashboard", "--symbol", symbol, "--steps", str(steps), "--tick", str(tick_interval)]
+    return main(argv + kwargs_to_argv(kwargs))
 
 
 if __name__ == "__main__":
