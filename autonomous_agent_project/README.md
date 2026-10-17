@@ -537,6 +537,54 @@ lỗ và luôn thấp hơn mọi agent còn vốn.
 Agent hoà vốn không vi phạm nhận đúng `initial_capital`, tức bằng điểm của agent đứng ngoài. Điểm chỉ thấp hơn mức
 này khi có lệnh ngược chiều mạnh hoặc Max DD giữa chừng vượt 20%.
 
+Tham số `other_costs` trừ thêm chi phí ngoài lệnh. Khi có chi phí, agent chưa giao dịch nhận `initial_capital −
+other_costs`, nên đứng ngoài không được miễn chi phí.
+
+### Tinh hoa theo Fitness production (`--elite-fitness`)
+
+Khi bật `--advanced-analysis`, GA mặc định dùng `Agent.production_fitness()` để xếp hạng nhóm tinh hoa và làm trọng
+số lai ghép (`--elite-fitness production`). Muốn quay về `Agent.fitness()` thì dùng `--elite-fitness agent`. Không bật
+`--advanced-analysis` thì luôn dùng `agent`, và kết quả với cùng seed không đổi.
+
+Các phần khác không đổi:
+* **Cổng.** Muốn vào nhóm tinh hoa vẫn phải đạt ngưỡng `Agent.fitness()`; cổng nhân bản cũng theo `Agent.fitness()`.
+* **Rà soát trùng gen.** Vẫn xếp hạng theo `Agent.fitness()`.
+
+Cách lấy dữ liệu và hiển thị:
+* **Lịch sử lệnh.** Điểm hợp lưu lúc vào lệnh được ghi vào `Position.context["confluence_score"]`. Khi đóng lệnh, agent
+  lưu `{pnl, action, confluence_score}` vào `trade_history`.
+* **Cách tính.** `production_fitness()` gọi `calculate_production_fitness(agent, trade_history, initial_capital,
+  other_costs=chi phí vận hành đã trả)`. Vốn trao cho con không bị trừ, nên giá trị danh mục bằng `equity` của agent.
+* **Checkpoint.** Checkpoint lưu `trade_history`. Checkpoint cũ không có trường này thì lãi lỗ đã thực hiện được gộp
+  thành một lệnh không chiều.
+* **Hiển thị.** Dashboard có cột "Fitness SX". Dòng `🧭` và báo cáo cuối hiện Fitness production cao nhất.
+
+```bash
+python main.py --advanced-analysis --seed 21 --tick 0                       # tinh hoa theo production
+python main.py --advanced-analysis --elite-fitness agent --seed 21 --tick 0 # đối chứng: tinh hoa theo Agent.fitness()
+```
+
+So sánh, bộ nhớ mới mỗi lần chạy. Mỗi ô ghi vốn còn lại (số agent sống/chết).
+
+| Seed | Mặc định (500 tick) | `--elite-fitness agent` (500) | `--elite-fitness production` (500) | agent (1500) | production (1500) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | $53.92 (4/1) | $57.65 (5/0) | $57.65 (5/0) | | |
+| 2 | $33.28 (4/1) | $33.20 (5/0) | $33.20 (5/0) | | |
+| 3 | $339.67 (12/1) | $236.80 (11/1) | $239.00 (11/1) | $537.60 (27/2) | $452.48 (22/2) |
+| 7 | $71.18 (9/1) | $73.36 (5/0) | $73.36 (5/0) | | |
+| 21 | $77.10 (5/0) | $123.78 (7/0) | $110.11 (7/0) | $194.27 (8/2) | $203.24 (9/3) |
+| 42 | $148.18 (6/2) | $135.96 (6/1) | $135.96 (6/1) | $232.09 (15/1) | $211.56 (15/1) |
+| 99 | $57.10 (5/0) | $84.05 (5/0) | $84.05 (5/0) | | |
+| 123 | $501.74 (21/0) | $345.17 (14/1) | $352.31 (11/1) | $1,225.65 (30/1) | $1,595.63 (30/1) |
+| **Tổng** | **$1,282.17 (66/6)** | **$1,089.97 (58/3)** | **$1,085.64 (55/3)** | **$2,189.61** | **$2,462.91** |
+
+Kết luận trung thực:
+* **500 tick.** Production gần như không khác `agent`: trùng hệt ở 5/8 seed, vì 500 tick chỉ có 0–7 lần lai ghép. Tổng
+  vốn kém hơn 0.4%.
+* **1500 tick.** Production thắng ở 2/4 seed và thua ở 2/4 seed. Tổng vốn cao hơn 12.5%, nhưng hoàn toàn nhờ seed 123
+  (+$370); bỏ seed này thì production kém hơn khoảng 10%.
+* **Chưa đủ bằng chứng.** Số liệu chưa cho thấy production tốt hơn. Cả hai biến thể đều kém chế độ mặc định ở 500 tick.
+
 ## Chạy test
 
 ```bash
@@ -546,7 +594,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-Bộ test (221 ca, không cần mạng, không cần TTY) bao phủ: `calculate_advanced_fitness` (4 test gốc của người dùng và các ca biên) và `calculate_advanced_fitness_scaled` (giá trị cụ thể cho từng nhánh, khớp bản gốc trên dữ liệu hợp lệ) và `calculate_production_fitness` (Max DD, phân hoá agent cháy tài khoản, hoà vốn = đứng ngoài), 100% dòng và nhánh của `core/evolution.py` (`tests/test_evolution.py`); `AdvancedMarketAnalyzer` (3 test gốc của người dùng, BOS/CHoCH, Order Block, Hidden Base, sóng, hệ số ×1.5 theo chiều), `CandleBuilder`, `ConfluenceFeed` với nến Binance được mock, gen `confluence_weight` (phủ quyết, tăng/giảm tỷ trọng, quy tắc CẤM vẫn chặn) và `--advanced-analysis` trong `main.py` (mặc định tắt, resume tất định, dashboard) (`tests/test_advanced_strategy.py`, `tests/test_strategy.py`, `tests/test_advanced_integration.py`); giá khởi điểm dự phòng theo cặp và tính độc lập với thang giá (`tests/test_fallback_price.py`); `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
+Bộ test (229 ca, không cần mạng, không cần TTY) bao phủ: `calculate_advanced_fitness` (4 test gốc của người dùng và các ca biên) và `calculate_advanced_fitness_scaled` (giá trị cụ thể cho từng nhánh, khớp bản gốc trên dữ liệu hợp lệ) và `calculate_production_fitness` (Max DD, phân hoá agent cháy tài khoản, hoà vốn = đứng ngoài, `other_costs`), lịch sử lệnh, `Agent.production_fitness()`, tinh hoa theo `--elite-fitness` (`tests/test_genetics.py`, `tests/test_advanced_integration.py`), 100% dòng và nhánh của `core/evolution.py` (`tests/test_evolution.py`); `AdvancedMarketAnalyzer` (3 test gốc của người dùng, BOS/CHoCH, Order Block, Hidden Base, sóng, hệ số ×1.5 theo chiều), `CandleBuilder`, `ConfluenceFeed` với nến Binance được mock, gen `confluence_weight` (phủ quyết, tăng/giảm tỷ trọng, quy tắc CẤM vẫn chặn) và `--advanced-analysis` trong `main.py` (mặc định tắt, resume tất định, dashboard) (`tests/test_advanced_strategy.py`, `tests/test_strategy.py`, `tests/test_advanced_integration.py`); giá khởi điểm dự phòng theo cặp và tính độc lập với thang giá (`tests/test_fallback_price.py`); `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
 chống trùng lặp gen và phân hoá ngách (`tests/test_genetics.py`); tự hủy (đúng ngưỡng $0.5, sau lệnh lỗ, chết đói, ngừng hoạt động sau khi chết), nhân
 bản (ngưỡng $40, trích $20, thế hệ/ID cha, đột biến trong biên, thừa kế bộ nhớ, trần quần thể), bộ lọc
 quy tắc (CAM, giảm quy mô, giới hạn đòn bẩy, ưu tiên, quy tắc hết hiệu lực, điều kiện sai định dạng),
