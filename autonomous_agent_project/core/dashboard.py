@@ -59,6 +59,7 @@ class AgentRow:
     state: str
     parent_id: str | None = None
     confluence_weight: float | None = None
+    production_fitness: float | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,9 @@ def _agents_table(rows: list[AgentRow], alive: int = 0, limit: int = MAX_AGENT_R
     table.add_column("Vốn", justify="right", no_wrap=True)
     table.add_column("Fitness", justify="right", no_wrap=True)
     show_weight = any(r.confluence_weight is not None for r in rows)
+    show_production = any(r.production_fitness is not None for r in rows)
+    if show_production:
+        table.add_column("Fitness SX", justify="right", no_wrap=True)
     if show_weight:
         table.add_column("Tin đa khung", justify="right", no_wrap=True)
     table.add_column("Trạng thái", no_wrap=True)
@@ -172,6 +176,8 @@ def _agents_table(rows: list[AgentRow], alive: int = 0, limit: int = MAX_AGENT_R
             f"[{cap_style}]${r.capital:,.2f}[/]",
             f"{r.fitness:+.2f}",
         ]
+        if show_production:
+            cells.append("—" if r.production_fitness is None else f"{r.production_fitness:.2f}")
         if show_weight:
             cells.append("—" if r.confluence_weight is None else f"{r.confluence_weight:.0%}")
         cells.append(f"[{STATE_STYLE.get(r.state, 'white')}]{r.state}[/]")
@@ -385,9 +391,10 @@ class EcosystemDashboard:
 
     def snapshot(self, step: int) -> EcosystemSnapshot:
         eco = self.eco
+        advanced = getattr(eco, "analysis_feed", None) is not None
         rows = [
             AgentRow(a.agent_id, a.generation, a.capital, a.fitness().score, a.state.value, a.parent_id,
-                     a.params.confluence_weight)
+                     a.params.confluence_weight, a.production_fitness() if advanced else None)
             for a in eco.agents
         ]
         cp = None

@@ -111,6 +111,7 @@ class Ecosystem:
                 base_mutation_rate=args.mutation_rate,
                 min_genome_distance=args.min_diversity,
             ),
+            elite_fitness=Agent.production_fitness if args.elite_fitness == "production" else None,
         )
         if args.resume and self._resume():
             return
@@ -386,8 +387,13 @@ class Ecosystem:
             self.genetics.mutation_rate(step),
         )
         if self.analysis_feed is not None:
-            log.info("🧭 Tick %4d | %s (%s) | gen tin đa khung TB %s", step, describe_analysis(self.analysis),
-                     self.analysis_feed.source, self._avg_confluence_weight())
+            log.info("🧭 Tick %4d | %s (%s) | gen tin đa khung TB %s | tinh hoa theo %s, %s", step,
+                     describe_analysis(self.analysis), self.analysis_feed.source, self._avg_confluence_weight(),
+                     self.args.elite_fitness, self._best_production())
+
+    def _best_production(self) -> str:
+        best = max(self.agents, key=lambda ag: ag.production_fitness(), default=None)
+        return "—" if best is None else f"Fitness SX cao nhất {best.agent_id} {best.production_fitness():.2f}"
 
     def _avg_confluence_weight(self) -> str:
         weights = [ag.params.confluence_weight for ag in self.agents if ag.params.confluence_weight is not None]
@@ -416,6 +422,9 @@ class Ecosystem:
         if self.analysis_feed is not None:
             print(f" Phân tích đa khung ({self.analysis_feed.source}): {describe_analysis(self.analysis)} | "
                   f"gen tin đa khung TB của agent sống: {self._avg_confluence_weight()}")
+            ranked = sorted(self.agents, key=lambda ag: ag.production_fitness(), reverse=True)[:5]
+            top = ", ".join(f"{ag.agent_id} {ag.production_fitness():.2f}" for ag in ranked) or "—"
+            print(f" Fitness production (tinh hoa theo {self.args.elite_fitness}): {top}")
         print(f" Bộ nhớ chung ({self.args.memory}): {mem['quy_tac']} quy tắc "
               f"({mem['quy_tac_hieu_luc']} hiệu lực), {mem['that_bai']} hồ sơ thất bại, "
               f"{mem['cai_chet']} hồ sơ cái chết, {mem['pha_he']} sự kiện sinh sản.")
@@ -470,6 +479,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--advanced-analysis", action="store_true",
                    help="Bật phân tích đa khung (SMC, Hidden Base, Elliott): điểm hợp lưu làm bộ lọc/thiên hướng "
                         "vào lệnh, mức tin tưởng là một gen do GA tự học")
+    p.add_argument("--elite-fitness", choices=("agent", "production"), default=None,
+                   help="Hàm xếp hạng/trọng số tinh hoa khi lai ghép: agent = Agent.fitness(), production = "
+                        "calculate_production_fitness (chỉ với --advanced-analysis; mặc định production khi bật cờ đó)")
     p.add_argument("--htf-ticks", type=int, default=8, help="Số tick gom thành một nến khung lớn (HTF)")
     p.add_argument("--ltf-ticks", type=int, default=2, help="Số tick gom thành một nến khung nhỏ (LTF)")
     p.add_argument("--htf-interval", type=str, default="1h",
@@ -497,6 +509,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.elite_size < 1 or not 0 <= args.crossover_prob <= 1 or args.min_diversity < 0 or args.diversity_every < 0:
         p.error("Tham số di truyền không hợp lệ: elite-size ≥ 1, 0 ≤ crossover-prob ≤ 1, "
                 "min-diversity ≥ 0, diversity-every ≥ 0")
+    if args.elite_fitness is None:
+        args.elite_fitness = "production" if args.advanced_analysis else "agent"
+    elif args.elite_fitness == "production" and not args.advanced_analysis:
+        p.error("--elite-fitness production cần --advanced-analysis (lịch sử lệnh chỉ có điểm hợp lưu khi bật cờ này)")
     if args.htf_ticks < 1 or args.ltf_ticks < 1:
         p.error("Tham số không hợp lệ: --htf-ticks và --ltf-ticks phải ≥ 1")
     if args.checkpoint_every < 0:

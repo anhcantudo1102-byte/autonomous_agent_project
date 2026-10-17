@@ -93,6 +93,37 @@ class TestAdvancedAnalysisMain(unittest.TestCase):
         self.assertTrue(all(ag.strategy.params is ag.params for ag in eco.agents))
         self.final(eco)
 
+    def test_chon_ham_fitness_tinh_hoa(self) -> None:
+        self.assertEqual(main.parse_args([]).elite_fitness, "agent")
+        self.assertEqual(main.parse_args(["--advanced-analysis"]).elite_fitness, "production")
+        self.assertEqual(main.parse_args(["--advanced-analysis", "--elite-fitness", "agent"]).elite_fitness, "agent")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            main.parse_args(["--elite-fitness", "production"])
+        self.assertIsNone(self.eco("--steps", "5", "--seed", "1").genetics.elite_fitness)
+        adv = self.eco("--steps", "5", "--seed", "1", "--advanced-analysis", memory="a.json")
+        self.assertIs(adv.genetics.elite_fitness, main.Agent.production_fitness)
+        ctrl = self.eco("--steps", "5", "--seed", "1", "--advanced-analysis", "--elite-fitness", "agent", memory="b.json")
+        self.assertIsNone(ctrl.genetics.elite_fitness)
+
+    def test_lich_su_lenh_vao_checkpoint_va_bao_cao(self) -> None:
+        eco = self.eco("--steps", "60", "--seed", "5", "--advanced-analysis", "--checkpoint-every", "60")
+        _, out = self.final(eco)
+        self.assertIn("Fitness production (tinh hoa theo production):", out)
+        data = ckpt.read_checkpoint(self.dir / "c.json", ckpt.KIND_ECOSYSTEM)
+        histories = [s["trade_history"] for s in data["agents"]]
+        self.assertTrue(any(histories))
+        for h in histories:
+            for t in h:
+                self.assertEqual(set(t), {"pnl", "action", "confluence_score"})
+                self.assertIn(t["action"], ("LONG", "SHORT"))
+        ag = eco.agents[0]
+        self.assertAlmostEqual(ag.initial_capital + sum(t["pnl"] for t in ag.trade_history)
+                               - ag.stats.operating_cost, ag.equity, places=4)
+
+    def test_mac_dinh_khong_ghi_lich_su_lenh(self) -> None:
+        states, _ = self.final(self.eco("--steps", "60", "--seed", "5"))
+        self.assertTrue(all(s["trade_history"] == [] for s in states))
+
     def test_tham_so_khong_hop_le(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             main.parse_args(["--htf-ticks", "0"])
@@ -106,7 +137,7 @@ class TestAdvancedAnalysisMain(unittest.TestCase):
         board = dash.EcosystemDashboard(eco, console=Console(file=io.StringIO()), require_terminal=False)
         text = dash.render_to_text(board.render(120), width=150, height=46)
         for label in ("Xu hướng HTF / cấu trúc", "Hidden Base (LTF)", "Sóng Elliott", "Điểm hợp lưu",
-                      "Khuyến nghị", "Tin đa khung", eco.analysis["recommended_action"]):
+                      "Khuyến nghị", "Tin đa khung", "Fitness SX", eco.analysis["recommended_action"]):
             self.assertIn(label, text)
 
         plain = self.eco("--steps", "20", "--seed", "3", memory="p.json")
@@ -115,6 +146,7 @@ class TestAdvancedAnalysisMain(unittest.TestCase):
         text = dash.render_to_text(board.render(20), width=150, height=46)
         self.assertNotIn("Điểm hợp lưu", text)
         self.assertNotIn("Tin đa khung", text)
+        self.assertNotIn("Fitness SX", text)
 
 
 if __name__ == "__main__":
