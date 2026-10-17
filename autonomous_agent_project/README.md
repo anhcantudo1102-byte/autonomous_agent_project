@@ -18,7 +18,9 @@ autonomous_agent_project/
 │   ├── agent.py         # Vòng đời agent, Fitness, Tự hủy, Tự nhân bản, GeneticController
 │   ├── strategy.py      # Thị trường, chiến lược, interface thực thi, bộ lọc quy tắc, toán tử gen
 │   ├── memory.py        # Reflexion: Post-Mortem, đúc kết quy tắc, ghi JSON atomic
-│   └── price_feed.py    # Lấy giá thật từ API công khai Binance (cần requests)
+│   ├── price_feed.py    # Lấy giá/nến thật từ API công khai Binance (cần requests)
+│   └── advanced_strategy.py # MultiDimensionalAnalyzer: SMC + Elliott (heuristic) + Hidden Base
+├── advanced_demo.py     # Demo phân tích đa khung thời gian (nến giả lập hoặc --live)
 ├── data/
 │   └── memory_bank.json # Bộ nhớ chung (tự tạo khi chạy, không commit)
 ├── tests/               # Unit test (unittest, tương thích pytest)
@@ -257,6 +259,42 @@ Lưu ý: giá thật thay đổi rất ít giữa các tick vài giây, thườn
 Agent vì thế chủ yếu đứng ngoài thị trường và chịu chi phí vận hành. Nên dùng `--tick` lớn hơn, ví dụ
 30–60 giây, để mỗi tick có biến động đáng kể.
 
+## Phân tích đa khung thời gian (`core/advanced_strategy.py`)
+
+`MultiDimensionalAnalyzer` kết hợp ba lớp phân tích trên nến OHLC (định dạng kline Binance):
+
+| Lớp | Khung | Cách làm |
+| --- | --- | --- |
+| SMC | HTF (mặc định 4h) | Swing fractal → BOS (close vượt đỉnh/thủng đáy swing gần nhất), sau đó HH/HL hoặc LH/LL |
+| Price Action / Hidden Base | LTF (mặc định 5m) | Phá vỡ nền giá chặt, sau đó nến nhấn chìm, sau đó thân nến ≥ 30% biên độ; doji → HOLD |
+| Elliott | HTF | **Heuristic động lượng**, không đếm sóng thật: động lượng ngắn mạnh hơn dài → `IMPULSE_WAVE_3`, cùng chiều → `IMPULSE_WAVE_5`, ngược chiều → `CORRECTIVE` |
+
+Điểm hợp lưu: +2 khi HTF BULLISH và LTF BUY, −2 khi BEARISH và SELL. Điểm này nhân 1.5 khi sóng 3
+**cùng chiều**. Kết quả ≥ 2 → LONG, ≤ −2 → SHORT, còn lại → WAIT.
+
+```bash
+python advanced_demo.py                       # nến giả lập xu hướng tăng (tái lập nhờ --seed)
+python advanced_demo.py --scenario giam       # kịch bản giảm; di_ngang → thường WAIT
+python advanced_demo.py --dummy-goc           # tái hiện dữ liệu dummy gốc (luôn WAIT)
+python advanced_demo.py --live --symbol ETHUSDT --htf 1h --ltf 5m   # nến thật, lỗi → nến giả lập
+```
+
+Output mẫu với `--live`:
+
+```
+📥 Nguồn nến: Binance BTCUSDT thật (4h/5m) — HTF 100 nến, LTF 50 nến, close cuối 81,502.01
+📊 Kết quả phân tích đa khung thời gian:
+   - Xu hướng HTF (SMC): BEARISH
+   - Tín hiệu LTF (Price Action/Hidden Base): BUY
+   - Trạng thái sóng Elliott (heuristic động lượng): IMPULSE_WAVE_3 (BEARISH)
+   - Điểm hợp lưu (Confluence Score): 0.0
+🤖 Quyết định của Agent: KIÊN NHẪN CHỜ ĐỢI (WAIT FOR SETUP).
+```
+
+Nến thật lấy qua `core.price_feed.fetch_klines` (`/api/v3/klines`). Khi bị chặn HTTP 451, hàm thử tiếp
+`data-api.binance.vision`. Bộ phân tích này **chưa nối vào vòng mô phỏng `main.py`**, vì thị trường mô
+phỏng chỉ sinh giá đóng cửa và không có nến OHLC.
+
 ## Chạy test
 
 ```bash
@@ -266,7 +304,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-Bộ test (61 ca, không cần mạng) bao phủ: chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
+Bộ test (81 ca, không cần mạng) bao phủ: phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
 chống trùng lặp gen và phân hoá ngách (`tests/test_genetics.py`); tự hủy (đúng ngưỡng $0.5, sau lệnh lỗ, chết đói, ngừng hoạt động sau khi chết), nhân
 bản (ngưỡng $40, trích $20, thế hệ/ID cha, đột biến trong biên, thừa kế bộ nhớ, trần quần thể), bộ lọc
 quy tắc (CAM, giảm quy mô, giới hạn đòn bẩy, ưu tiên, quy tắc hết hiệu lực, điều kiện sai định dạng),
