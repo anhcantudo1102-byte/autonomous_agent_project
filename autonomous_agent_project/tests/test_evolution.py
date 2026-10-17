@@ -276,5 +276,122 @@ class TestAdvancedFitnessScaled(unittest.TestCase):
             self.assertAlmostEqual(self.fit(trades), goc(trades), places=6)
 
 
+from core.evolution import calculate_production_fitness, max_drawdown_from_trades  # noqa: E402
+
+
+def T(pnl, action=None, score=None):
+    return {"pnl": pnl, "action": action, "confluence_score": score}
+
+
+class TestProductionFitness(unittest.TestCase):
+    """Fitness thương mại (vốn 20): vốn cuối ± 0.1%/0.2% vốn mỗi lệnh hợp lưu mạnh − phạt Max DD > 20%."""
+
+    def fit(self, trades, **kw):
+        return calculate_production_fitness({"id": 1}, trades, **kw)
+
+    def test_chua_giao_dich_tra_ve_von_goc(self):
+        self.assertEqual(self.fit([]), 20.0)
+        self.assertEqual(self.fit(None), 20.0)
+        self.assertEqual(self.fit([], initial_capital=50), 50.0)
+
+    def test_thuong_lenh_thuan_chieu_manh(self):
+        self.assertEqual(self.fit([T(2.0, "BUY", 3.0)]), 22.02)  # 22 + 0.1% × 20
+        self.assertEqual(self.fit([T(0.0, "SELL", -2.5)]), 20.02)
+        self.assertEqual(self.fit([T(0.0, "BUY", 2.0)]), 20.02)  # đúng ngưỡng
+        self.assertEqual(self.fit([T(0.0, "BUY", 7.5)]), 20.02)  # không nhân theo |score|
+
+    def test_phat_lenh_nguoc_chieu_manh(self):
+        self.assertEqual(self.fit([T(2.0, "BUY", -3.0)]), 21.96)  # 22 − 0.2% × 20
+        self.assertEqual(self.fit([T(0.0, "SELL", 2.0)]), 19.96)
+
+    def test_khong_phat_nhieu_va_vung_giua(self):
+        for score in (0.0, 0.1, -0.49, 0.5, 1.0, -1.99):
+            for action in ("BUY", "SELL"):
+                with self.subTest(score=score, action=action):
+                    self.assertEqual(self.fit([T(0.0, action, score)]), 20.0)
+
+    def test_hoa_von_khong_vi_pham_bang_dung_ngoai(self):
+        trades = [T(1.0, "BUY", 0.1), T(-1.0, "SELL", 1.0), T(0.0, "HOLD", -3.0), T(0.0)]
+        self.assertEqual(self.fit(trades), self.fit([]))
+
+    def test_hoa_von_van_thap_hon_von_goc_khi(self):
+        self.assertEqual(self.fit([T(0.0, "BUY", -3.0)]), 19.96)  # lệnh ngược chiều mạnh
+        self.assertEqual(self.fit([T(-10.0), T(10.0)]), 19.4)  # DD 50% → −0.1 × 20 × 0.3
+        self.assertEqual(self.fit([T(1.0, "BUY", 3.0), T(-1.0, "BUY", -3.0)]), 19.98)  # thưởng 0.02 < phạt 0.04
+
+    def test_phat_drawdown_chi_phan_vuot_nguong(self):
+        self.assertEqual(self.fit([T(-4.0), T(4.0)]), 20.0)  # DD đúng 20%: chưa phạt
+        self.assertEqual(self.fit([T(20.0), T(-16.0)]), 23.6)  # đỉnh 40 → 24: DD 40% → −0.4
+        self.assertEqual(self.fit([T(-30.0), T(40.0)]), 28.4)  # vốn âm giữa chừng: DD kẹp 100% → −1.6
+
+    def test_max_drawdown_tu_duong_von(self):
+        self.assertEqual(max_drawdown_from_trades([], 20), 0.0)
+        self.assertEqual(max_drawdown_from_trades([5, -10], 20), 0.4)
+        self.assertEqual(max_drawdown_from_trades([-10, 5, -10], 20), 0.75)
+        self.assertEqual(max_drawdown_from_trades([-30], 20), 1.0)
+
+    def test_con_von_nhung_duoi_san(self):
+        self.assertEqual(self.fit([T(-19.999)]), 0.01)
+
+    def test_chay_tai_khoan_phan_hoa_theo_muc_lo(self):
+        blown = [self.fit([T(pnl)]) for pnl in (-20.0, -25.0, -40.0, -1e6)]
+        self.assertEqual(blown[:3], [0.005, 0.004, 0.0025])  # 0.01 × 0.5 / (1 + |vốn cuối| / 20)
+        self.assertAlmostEqual(blown[3], 1e-7)
+        self.assertTrue(all(a > b > 0 for a, b in zip(blown, blown[1:])))
+        self.assertLess(blown[0], self.fit([T(-19.999)]))  # luôn dưới agent còn vốn
+        self.assertEqual(self.fit([T(-20.0, "BUY", 3.0)]), 0.005)  # không cộng thưởng khi đã cháy
+
+    def test_tham_so_tuy_chinh(self):
+        trades = [T(2.0, "BUY", 1.0), T(-4.0, "SELL", 1.0)]
+        # 18 + 0.01×20 − 0.05×20 − 1×20×(4/22 − 0.1) = 15.563636
+        f = self.fit(trades, strong_threshold=1, aligned_bonus_rate=0.01, counter_penalty_rate=0.05,
+                     drawdown_threshold=0.1, drawdown_penalty_rate=1, floor=1, blown_ratio=0.2)
+        self.assertEqual(f, 15.563636)
+        self.assertAlmostEqual(self.fit([T(-30.0)], floor=1, blown_ratio=0.2), 0.2 / 1.5)
+        self.assertEqual(self.fit([T(0.0, "BUY", 0.0)], strong_threshold=0), 20.0)
+        self.assertEqual(self.fit([T(10.0, "BUY", 3.0)], initial_capital=100), 110.1)
+
+    def test_action_hoa_thuong_dong_nghia_va_doi_tuong(self):
+        trades = [T(0, "long", 3), T(0, "Short", -3), T(0, "strong_sell", 3), T(None, "buy", None)]
+        self.assertEqual(self.fit(trades), 20.0)  # +0.02 +0.02 −0.04
+        self.assertEqual(self.fit([Lenh(2.0, "STRONG_BUY", 2.5), Lenh()]), 22.02)
+
+    def test_gia_tri_khong_hop_le(self):
+        for capital in (0, -1, float("nan"), float("inf"), "20", True, None):
+            with self.subTest(capital=capital), self.assertRaises(ValueError):
+                self.fit([], initial_capital=capital)
+        for trade in (T(float("nan")), T("1"), T(1, "BUY", float("inf")), T(1, "BUY", True)):
+            with self.subTest(trade=trade), self.assertRaises(ValueError):
+                self.fit([trade])
+        for name in ("strong_threshold", "aligned_bonus_rate", "counter_penalty_rate", "drawdown_threshold",
+                     "drawdown_penalty_rate", "floor", "blown_ratio"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.fit([], **{name: -0.1})
+        with self.assertRaises(ValueError):
+            self.fit([], blown_ratio=1.0)
+
+    def test_khop_ban_goc_khi_con_von_va_dd_nho(self):
+        def goc(history, initial_capital=20.0):
+            if not history:
+                return initial_capital
+            value = initial_capital + sum(t.get("pnl", 0.0) for t in history)
+            if value <= 0:
+                return 0.01
+            adj = 0.0
+            for t in history:
+                a, s = t.get("action"), t.get("confluence_score", 0.0)
+                if (a == "BUY" and s >= 2.0) or (a == "SELL" and s <= -2.0):
+                    adj += 0.001 * initial_capital
+                elif (a == "BUY" and s <= -2.0) or (a == "SELL" and s >= 2.0):
+                    adj -= 0.002 * initial_capital
+            return max(0.01, value + adj)
+
+        rng = __import__("random").Random(5)
+        for _ in range(200):
+            trades = [T(round(rng.uniform(-0.5, 0.5), 2), rng.choice(["BUY", "SELL", "HOLD"]),
+                        round(rng.uniform(-7.5, 7.5), 1)) for _ in range(rng.randint(1, 6))]
+            self.assertAlmostEqual(self.fit(trades), goc(trades), places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

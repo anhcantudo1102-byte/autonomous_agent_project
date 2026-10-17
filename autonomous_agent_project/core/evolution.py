@@ -4,7 +4,9 @@ Hai hàm ở đây **độc lập** với ``Agent.fitness()`` (GA hiện tại v
 giá một chuỗi lệnh đã ghi lại cùng điểm hợp lưu tại thời điểm vào lệnh:
 
 * ``calculate_advanced_fitness``: điểm tuyệt đối (pnl ± thưởng/phạt cố định);
-* ``calculate_advanced_fitness_scaled``: giá trị danh mục theo ROI, thưởng/phạt quy đổi thành % vốn.
+* ``calculate_advanced_fitness_scaled``: giá trị danh mục theo ROI, thưởng/phạt quy đổi thành % vốn;
+* ``calculate_production_fitness``: giá trị danh mục thực, thưởng/phạt hợp lưu nhẹ, phạt Max Drawdown sâu,
+  phân hoá agent cháy tài khoản.
 """
 
 from __future__ import annotations
@@ -36,6 +38,19 @@ def _number(value: Any, name: str, index: int) -> float:
     if not math.isfinite(value):
         raise ValueError(f"Lệnh #{index}: '{name}' phải là số hữu hạn, nhận {value!r}")
     return value
+
+
+def _validate_capital(initial_capital: Any) -> float:
+    valid = isinstance(initial_capital, (int, float)) and not isinstance(initial_capital, bool)
+    if not (valid and math.isfinite(initial_capital) and initial_capital > 0):
+        raise ValueError(f"initial_capital phải là số hữu hạn > 0, nhận {initial_capital!r}")
+    return float(initial_capital)
+
+
+def _validate_non_negative(**params: float) -> None:
+    for name, value in params.items():
+        if value < 0:
+            raise ValueError(f"Tham số '{name}' phải ≥ 0, nhận {value!r}")
 
 
 def _direction(action: Any) -> int:
@@ -83,10 +98,8 @@ def calculate_advanced_fitness(
     ``agent`` hiện chưa được dùng trong công thức (giữ trong chữ ký theo đặc tả, để mở rộng sau).
     Kết quả làm tròn 6 chữ số thập phân để tránh sai số dấu phẩy động khi so sánh.
     """
-    for name, value in (("bonus_per_point", bonus_per_point), ("counter_penalty", counter_penalty),
-                        ("noise_penalty", noise_penalty), ("noise_threshold", noise_threshold)):
-        if value < 0:
-            raise ValueError(f"Tham số '{name}' phải ≥ 0, nhận {value!r}")
+    _validate_non_negative(bonus_per_point=bonus_per_point, counter_penalty=counter_penalty,
+                           noise_penalty=noise_penalty, noise_threshold=noise_threshold)
 
     total = 0.0
     for index, trade in enumerate(trades or ()):
@@ -154,15 +167,10 @@ def calculate_advanced_fitness_scaled(
     agent hoà vốn nhưng vi phạm kỷ luật, còn mọi agent lỗ gần hết vốn đều dồn về 0.1.
     ``agent`` chưa được dùng trong công thức. Kết quả làm tròn 6 chữ số thập phân.
     """
-    valid = isinstance(initial_capital, (int, float)) and not isinstance(initial_capital, bool)
-    if not (valid and math.isfinite(initial_capital) and initial_capital > 0):
-        raise ValueError(f"initial_capital phải là số hữu hạn > 0, nhận {initial_capital!r}")
-    capital = float(initial_capital)
-    for name, value in (("strong_threshold", strong_threshold), ("bonus_rate_per_point", bonus_rate_per_point),
-                        ("counter_penalty_rate", counter_penalty_rate), ("noise_penalty_rate", noise_penalty_rate),
-                        ("noise_threshold", noise_threshold)):
-        if value < 0:
-            raise ValueError(f"Tham số '{name}' phải ≥ 0, nhận {value!r}")
+    capital = _validate_capital(initial_capital)
+    _validate_non_negative(strong_threshold=strong_threshold, bonus_rate_per_point=bonus_rate_per_point,
+                           counter_penalty_rate=counter_penalty_rate, noise_penalty_rate=noise_penalty_rate,
+                           noise_threshold=noise_threshold)
 
     trades = list(trade_history or ())
     if not trades:
@@ -192,3 +200,105 @@ def calculate_advanced_fitness_scaled(
 
     ratio = total_pnl / capital + adjustment
     return round(max(floor, capital * (1.0 + ratio)), 6)
+
+
+PRODUCTION_INITIAL_CAPITAL = 20.0
+PRODUCTION_STRONG_THRESHOLD = 2.0
+PRODUCTION_ALIGNED_BONUS_RATE = 0.001
+PRODUCTION_COUNTER_PENALTY_RATE = 0.002
+PRODUCTION_DRAWDOWN_THRESHOLD = 0.20
+PRODUCTION_DRAWDOWN_PENALTY_RATE = 0.10
+PRODUCTION_FLOOR = 0.01
+PRODUCTION_BLOWN_RATIO = 0.5
+
+
+def max_drawdown_from_trades(pnls: Iterable[float], initial_capital: float) -> float:
+    """Max Drawdown (0–1) của đường vốn ``initial_capital + pnl cộng dồn`` theo đúng thứ tự lệnh.
+
+    Đỉnh tính cả vốn khởi đầu; sụt quá 100% (vốn âm) được kẹp về 1.0.
+    """
+    equity = peak = float(initial_capital)
+    worst = 0.0
+    for pnl in pnls:
+        equity += pnl
+        peak = max(peak, equity)
+        worst = max(worst, (peak - equity) / peak)
+    return min(1.0, worst)
+
+
+def calculate_production_fitness(
+    agent: Any,
+    trade_history: Iterable[Any] | None,
+    initial_capital: float = PRODUCTION_INITIAL_CAPITAL,
+    *,
+    strong_threshold: float = PRODUCTION_STRONG_THRESHOLD,
+    aligned_bonus_rate: float = PRODUCTION_ALIGNED_BONUS_RATE,
+    counter_penalty_rate: float = PRODUCTION_COUNTER_PENALTY_RATE,
+    drawdown_threshold: float = PRODUCTION_DRAWDOWN_THRESHOLD,
+    drawdown_penalty_rate: float = PRODUCTION_DRAWDOWN_PENALTY_RATE,
+    floor: float = PRODUCTION_FLOOR,
+    blown_ratio: float = PRODUCTION_BLOWN_RATIO,
+) -> float:
+    """Fitness "thương mại": giá trị danh mục thực, điều chỉnh nhẹ theo kỷ luật hợp lưu và Drawdown.
+
+    ``vốn cuối = initial_capital + tổng pnl``. Nếu ``vốn cuối > 0``::
+
+        điểm = vốn cuối
+             + aligned_bonus_rate × vốn ban đầu × (số lệnh thuận chiều, |score| ≥ strong_threshold)
+             − counter_penalty_rate × vốn ban đầu × (số lệnh ngược chiều, |score| ≥ strong_threshold)
+             − drawdown_penalty_rate × vốn ban đầu × max(0, MaxDD − drawdown_threshold)
+        điểm = max(floor, điểm)
+
+    Mặc định: thưởng 0.1% vốn/lệnh, phạt 0.2% vốn/lệnh, chỉ phạt phần Max DD vượt 20% với hệ số 0.1
+    (DD 50% → −3% vốn, tối đa −8% vốn khi DD 100%), nên không lấn át lãi lỗ thực tế. Max DD lấy từ
+    đường vốn cộng dồn theo **thứ tự** ``trade_history`` (xem ``max_drawdown_from_trades``).
+    **Không** phạt giao dịch trong vùng nhiễu (kể cả ``|score| < 0.5``); vùng ``|score| < strong_threshold``
+    không thưởng/phạt.
+
+    Agent cháy tài khoản (``vốn cuối ≤ 0``) nhận ``floor × blown_ratio / (1 + |vốn cuối| / initial_capital)``:
+    luôn dương, giảm đơn điệu theo mức lỗ và luôn nhỏ hơn ``floor`` — tức nhỏ hơn mọi agent còn vốn.
+    Dùng dạng hữu tỷ thay cho ``exp`` vì ``exp`` tràn dưới về 0 khi lỗ rất sâu. Nhánh này không làm tròn
+    (để các giá trị rất nhỏ vẫn phân biệt được); nhánh còn lại làm tròn 6 chữ số.
+
+    Quy ước chung với hai hàm trên: chưa có lệnh → đúng ``initial_capital``; ``action`` không phân biệt hoa
+    thường, ``LONG``/``SHORT``/``STRONG_*`` được chấp nhận, ``HOLD``/lạ → chỉ tính pnl; ``pnl``/``score``
+    thiếu hoặc ``None`` → 0 / không thưởng-phạt; dict hoặc đối tượng; số không hợp lệ, NaN, vô cực,
+    ``initial_capital`` ≤ 0 hoặc tham số âm → ``ValueError``. ``agent`` chưa được dùng.
+
+    Agent hoà vốn, không có lệnh ngược chiều mạnh và Max DD ≤ ngưỡng nhận đúng ``initial_capital`` (bằng
+    đứng ngoài). Điểm vẫn thấp hơn ``initial_capital`` dù hoà vốn khi có lệnh ngược chiều mạnh (nhiều hơn
+    số lệnh thuận chiều × tỷ lệ thưởng/phạt) hoặc Max DD giữa chừng vượt ngưỡng.
+    """
+    capital = _validate_capital(initial_capital)
+    _validate_non_negative(strong_threshold=strong_threshold, aligned_bonus_rate=aligned_bonus_rate,
+                           counter_penalty_rate=counter_penalty_rate, drawdown_threshold=drawdown_threshold,
+                           drawdown_penalty_rate=drawdown_penalty_rate, floor=floor, blown_ratio=blown_ratio)
+    if blown_ratio >= 1:
+        raise ValueError(f"blown_ratio phải < 1 để agent cháy tài khoản luôn dưới sàn, nhận {blown_ratio!r}")
+
+    trades = list(trade_history or ())
+    if not trades:
+        return capital
+
+    pnls: list[float] = []
+    adjustment = 0.0
+    for index, trade in enumerate(trades):
+        pnl = _field(trade, "pnl")
+        pnls.append(0.0 if pnl is None else _number(pnl, "pnl", index))
+
+        raw_score = _field(trade, "confluence_score")
+        if raw_score is None:
+            continue
+        score = _number(raw_score, "confluence_score", index)
+        direction = _direction(_field(trade, "action"))
+        if direction == 0 or score == 0 or abs(score) < strong_threshold:
+            continue
+        adjustment += aligned_bonus_rate * capital if direction * score > 0 else -counter_penalty_rate * capital
+
+    portfolio = capital + sum(pnls)
+    if portfolio <= 0:
+        return floor * blown_ratio / (1.0 + abs(portfolio) / capital)
+
+    drawdown = max_drawdown_from_trades(pnls, capital)
+    drawdown_penalty = drawdown_penalty_rate * capital * max(0.0, drawdown - drawdown_threshold)
+    return round(max(floor, portfolio + adjustment - drawdown_penalty), 6)
