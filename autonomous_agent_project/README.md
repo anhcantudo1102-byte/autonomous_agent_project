@@ -20,14 +20,16 @@ autonomous_agent_project/
 │   ├── memory.py        # Reflexion: Post-Mortem, đúc kết quy tắc, ghi JSON atomic
 │   ├── price_feed.py    # Lấy giá/nến thật từ API công khai Binance (cần requests)
 │   ├── advanced_strategy.py # MultiDimensionalAnalyzer: SMC + Elliott (heuristic) + Hidden Base
-│   └── checkpoint.py    # Lưu/khôi phục checkpoint quần thể (atomic, có schema_version)
+│   ├── checkpoint.py    # Lưu/khôi phục checkpoint quần thể (atomic, có schema_version)
+│   └── dashboard.py     # Dashboard terminal bằng rich (tuỳ chọn): quần thể, sự kiện, di truyền
 ├── advanced_demo.py     # Demo phân tích đa khung thời gian (nến giả lập hoặc --live)
 ├── evolution_demo.py    # Demo tiến hoá: chạy lại là tiếp tục từ thế hệ đã lưu
+├── dashboard_demo.py    # Demo dashboard với dữ liệu giả
 ├── data/
 │   └── memory_bank.json # Bộ nhớ chung (tự tạo khi chạy, không commit)
 ├── checkpoints/         # Checkpoint quần thể (tự tạo khi bật checkpoint, không commit)
 ├── tests/               # Unit test (unittest, tương thích pytest)
-└── requirements.txt     # requests (chỉ cho price_feed); mô phỏng dùng thư viện chuẩn
+└── requirements.txt     # requests (price_feed), rich (dashboard, tuỳ chọn); mô phỏng dùng thư viện chuẩn
 ```
 
 ## Cách chạy nhanh
@@ -95,6 +97,7 @@ python main.py --memory /tmp/thi_nghiem.json --reset-memory --tick 0
 | `--checkpoint-every` | 0 (tắt) | Lưu checkpoint quần thể sau mỗi N tick, cộng một lần khi kết thúc/Ctrl+C |
 | `--checkpoint-file` | `checkpoints/ecosystem_checkpoint.json` | Tệp checkpoint (tách biệt với bộ nhớ chung) |
 | `--resume` | tắt | Khôi phục quần thể từ checkpoint rồi chạy tiếp `--steps` tick |
+| `--dashboard` | tắt | Dashboard trực quan trên terminal (cần `rich`; không có thì dùng log thường) |
 | `--no-fsync` | tắt | Bỏ `fsync` khi ghi để chạy nhanh hơn (vẫn atomic nhờ `os.replace`) |
 | `-v` / `-q` | | Chi tiết hơn / chỉ cảnh báo |
 
@@ -265,6 +268,32 @@ Lưu ý: giá thật thay đổi rất ít giữa các tick vài giây, thườn
 Agent vì thế chủ yếu đứng ngoài thị trường và chịu chi phí vận hành. Nên dùng `--tick` lớn hơn, ví dụ
 30–60 giây, để mỗi tick có biến động đáng kể.
 
+## Dashboard trên terminal (`core/dashboard.py`)
+
+```bash
+pip install rich                                   # tuỳ chọn, chỉ cần cho dashboard
+python main.py --dashboard --tick 0.05 --seed 7    # mô phỏng thật, hiển thị bằng dashboard
+python main.py --dashboard --checkpoint-every 100  # kèm checkpoint, Ctrl+C vẫn lưu
+python dashboard_demo.py --steps 40 --delay 0.3    # demo độc lập với dữ liệu giả
+```
+
+Dashboard gồm bốn phần:
+
+* **Thị trường & agent:** bước hiện tại / tổng, giá, biến động, chế độ thị trường, số agent sống/chết,
+  tổng vốn, độ đa dạng gen, biên độ đột biến, số quy tắc hiệu lực, agent tốt nhất (`N/A` khi chưa có).
+* **Quần thể đang sống:** ID, thế hệ, cha, vốn, Fitness, trạng thái, xếp theo Fitness (tối đa 12 dòng).
+* **Sự kiện gần nhất:** agent ra đời, agent tự hủy (kèm nguyên nhân), quy tắc **CẤM** mới.
+* **Tiêu đề và chân trang:** cặp giao dịch, nguồn giá (thật/giả lập), tệp checkpoint, lần lưu cuối.
+
+Khi dashboard chạy, log từng agent bị ẩn (sinh/chết đã có trong bảng sự kiện). Cảnh báo khác vẫn in
+phía trên khung. Báo cáo cuối in như bình thường sau khi dashboard đóng. `Ctrl+C` dừng êm sau tick
+hiện tại và lưu checkpoint nếu đã bật.
+
+Nếu chưa cài `rich`, hoặc terminal không hỗ trợ (không phải TTY, `TERM=dumb`, chuyển hướng ra tệp),
+chương trình in cảnh báo rồi chạy với log thường. Dashboard chỉ hiển thị, không ảnh hưởng kết quả mô
+phỏng: cùng seed thì có và không có `--dashboard` cho ra cùng một quần thể. Biến môi trường
+`NO_COLOR=1` tắt màu.
+
 ## Checkpoint quần thể (`core/checkpoint.py`)
 
 Mặc định không có checkpoint, hành vi như cũ. Bật lên bằng cờ:
@@ -351,7 +380,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-Bộ test (104 ca, không cần mạng) bao phủ: checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
+Bộ test (120 ca, không cần mạng, không cần TTY) bao phủ: dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
 chống trùng lặp gen và phân hoá ngách (`tests/test_genetics.py`); tự hủy (đúng ngưỡng $0.5, sau lệnh lỗ, chết đói, ngừng hoạt động sau khi chết), nhân
 bản (ngưỡng $40, trích $20, thế hệ/ID cha, đột biến trong biên, thừa kế bộ nhớ, trần quần thể), bộ lọc
 quy tắc (CAM, giảm quy mô, giới hạn đòn bẩy, ưu tiên, quy tắc hết hiệu lực, điều kiện sai định dạng),

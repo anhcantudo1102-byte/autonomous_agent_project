@@ -3,5 +3,9 @@
 # requests: chỉ cần cho core/price_feed.py (lấy giá thật từ API công khai Binance).
 requests>=2.28
 #
+# rich: tuỳ chọn, chỉ cần cho dashboard (main.py --dashboard, dashboard_demo.py). Không cài thì
+# main.py in cảnh báo và dùng log thường.
+rich>=13
+#
 # Tuỳ chọn: nếu muốn chạy test bằng pytest thay cho unittest có sẵn, bỏ dấu # ở dòng dưới.
 # pytest>=7
