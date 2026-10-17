@@ -58,6 +58,7 @@ class AgentRow:
     fitness: float
     state: str
     parent_id: str | None = None
+    confluence_weight: float | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,41 @@ class EcosystemSnapshot:
     checkpoint: str | None = None
     agents: list[AgentRow] = field(default_factory=list)
     events: list[DashboardEvent] = field(default_factory=list)
+    # Kết quả AdvancedMarketAnalyzer.analyze_multi_timeframe (+ "source"); None khi không bật --advanced-analysis.
+    analysis: dict[str, Any] | None = None
+
+
+TREND_STYLE = {"BULLISH": "green", "BEARISH": "red"}
+ACTION_STYLE = {"STRONG_BUY": "bold green", "BUY": "green", "STRONG_SELL": "bold red", "SELL": "red"}
+
+
+def _analysis_rows(analysis: dict[str, Any]) -> list[tuple[str, str]]:
+    """Các dòng (nhãn, giá trị) mô tả phân tích đa khung cho bảng thị trường."""
+    trend = analysis.get("htf_trend", "NEUTRAL")
+    event = analysis.get("market_structure_event", "NONE")
+    base = analysis.get("hidden_base") or {}
+    signal = base.get("signal", "HOLD")
+    zone = base.get("zone") or (0, 0)
+    base_text = signal if signal == "HOLD" else f"{signal} [{format_price(zone[0])}–{format_price(zone[1])}]"
+    ob = analysis.get("order_block")
+    score = float(analysis.get("confluence_score", 0.0))
+    action = analysis.get("recommended_action", "HOLD")
+    score_style = "green" if score > 0 else "red" if score < 0 else "white"
+    rows = [
+        ("Xu hướng HTF / cấu trúc", f"[{TREND_STYLE.get(trend, 'white')}]{trend}[/] / {event}"),
+        ("Hidden Base (LTF)", base_text),
+        ("Sóng Elliott", str(analysis.get("elliott_wave", "—"))),
+    ]
+    if ob:
+        lo, hi = ob.get("zone") or (0, 0)
+        rows.append(("Order Block", f"{ob.get('type', '?')} [{format_price(lo)}–{format_price(hi)}]"))
+    rows += [
+        ("Điểm hợp lưu", f"[{score_style}]{score:+.1f}[/]"),
+        ("Khuyến nghị", f"[{ACTION_STYLE.get(action, 'white')}]{action}[/]"),
+    ]
+    if analysis.get("source"):
+        rows.append(("Nguồn nến", str(analysis["source"])))
+    return rows
 
 
 def _best_fields(best_agent: dict[str, Any] | None) -> tuple[str, str]:
@@ -122,22 +158,28 @@ def _agents_table(rows: list[AgentRow], alive: int = 0, limit: int = MAX_AGENT_R
     table.add_column("Cha", no_wrap=True, style="dim")
     table.add_column("Vốn", justify="right", no_wrap=True)
     table.add_column("Fitness", justify="right", no_wrap=True)
+    show_weight = any(r.confluence_weight is not None for r in rows)
+    if show_weight:
+        table.add_column("Tin đa khung", justify="right", no_wrap=True)
     table.add_column("Trạng thái", no_wrap=True)
     ranked = sorted(rows, key=lambda r: r.fitness, reverse=True)
     for r in ranked[:limit]:
         cap_style = "green" if r.capital >= 20 else "yellow" if r.capital >= 5 else "red"
-        table.add_row(
+        cells = [
             r.agent_id,
             str(r.generation),
             r.parent_id or "-",
             f"[{cap_style}]${r.capital:,.2f}[/]",
             f"{r.fitness:+.2f}",
-            f"[{STATE_STYLE.get(r.state, 'white')}]{r.state}[/]",
-        )
+        ]
+        if show_weight:
+            cells.append("—" if r.confluence_weight is None else f"{r.confluence_weight:.0%}")
+        cells.append(f"[{STATE_STYLE.get(r.state, 'white')}]{r.state}[/]")
+        table.add_row(*cells)
     if not ranked:
         table.caption = ("Không có dữ liệu chi tiết từng agent" if alive else "Chưa có agent nào đang sống")
     elif len(ranked) > limit:
-        table.add_row(f"[dim]… và {len(ranked) - limit} agent khác[/dim]", "", "", "", "", "")
+        table.add_row(f"[dim]… và {len(ranked) - limit} agent khác[/dim]", *[""] * (len(table.columns) - 1))
     return table
 
 
@@ -205,7 +247,12 @@ def generate_dashboard_view(
         info.add_row("Quy tắc hiệu lực", str(stats.rules_active))
     info.add_row("Agent xuất sắc nhất (ID)", f"ID: {best_id}")
     info.add_row("Fitness tối đa", best_fitness)
-    layout["market"].size = info.row_count + 6  # viền panel + tiêu đề bảng + đường kẻ + lề box
+    if stats.analysis:
+        info.add_section()
+        for label, value in _analysis_rows(stats.analysis):
+            info.add_row(label, value)
+    # viền panel + tiêu đề bảng + đường kẻ + lề box (+1 đường kẻ ngăn phần phân tích đa khung)
+    layout["market"].size = info.row_count + 6 + (1 if stats.analysis else 0)
     layout["market"].update(Panel(info, title="Trạng thái Thị trường & Agent"))
     layout["events"].update(_events_panel(stats.events))
     layout["right"].update(Panel(
@@ -339,7 +386,8 @@ class EcosystemDashboard:
     def snapshot(self, step: int) -> EcosystemSnapshot:
         eco = self.eco
         rows = [
-            AgentRow(a.agent_id, a.generation, a.capital, a.fitness().score, a.state.value, a.parent_id)
+            AgentRow(a.agent_id, a.generation, a.capital, a.fitness().score, a.state.value, a.parent_id,
+                     a.params.confluence_weight)
             for a in eco.agents
         ]
         cp = None
@@ -358,6 +406,7 @@ class EcosystemDashboard:
             checkpoint=cp,
             agents=rows,
             events=list(self.events),
+            analysis=getattr(eco, "analysis", None),
         )
 
     def render(self, step: int, snap: Any = None) -> "Layout":
