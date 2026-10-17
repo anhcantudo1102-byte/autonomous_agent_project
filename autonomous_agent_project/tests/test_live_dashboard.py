@@ -83,7 +83,7 @@ class TestRunSimulationWithDashboard(unittest.TestCase):
                 code, out = self.run_fn(steps=4, tick_interval=0, seed=1)
         self.assertEqual(code, 0)
         text = "\n".join(logs.output)
-        self.assertIn("GIẢ LẬP", text)
+        self.assertIn("Kích hoạt chế độ giả lập với giá khởi điểm thực tế: 82,000.00 cho BTCUSDT", text)
         self.assertIn("Không bật được --dashboard", text)
         self.assertIn("BÁO CÁO CUỐI CÙNG sau 4 tick", out)
 

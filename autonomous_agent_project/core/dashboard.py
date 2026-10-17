@@ -31,6 +31,8 @@ try:
 except ImportError:  # pragma: no cover - phụ thuộc môi trường
     RICH_AVAILABLE = False
 
+from .price_feed import format_price
+
 if TYPE_CHECKING:
     from rich.console import Console as ConsoleType
 
@@ -190,7 +192,7 @@ def generate_dashboard_view(
     step_text = f"{step}" if stats.total_steps is None else f"{step} / {stats.total_steps}"
     change_style = "green" if price_change > 0 else "red" if price_change < 0 else "white"
     info.add_row("Bước mô phỏng (Step)", step_text)
-    info.add_row("Giá hiện tại", f"{current_price:,.2f} USDT")
+    info.add_row("Giá hiện tại", f"{format_price(current_price)} USDT")
     info.add_row("Biến động", f"[{change_style}]{price_change:+.2f}%[/]")
     if stats.regime:
         info.add_row("Chế độ thị trường", stats.regime)
@@ -366,7 +368,7 @@ class EcosystemDashboard:
         snap = snap or eco.market.snapshot()
         stats = self.snapshot(step)
         stats.regime = TEN_CHE_DO.get(snap.regime, snap.regime)
-        symbol = getattr(eco.market, "symbol", "GIẢ LẬP")
+        symbol = getattr(eco.market, "symbol", None) or getattr(eco, "symbol", None) or "GIẢ LẬP"
         self.frames += 1
         return generate_dashboard_view(
             step=step,

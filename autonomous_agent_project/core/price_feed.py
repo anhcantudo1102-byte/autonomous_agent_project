@@ -35,6 +35,35 @@ BINANCE_ENDPOINTS: tuple[str, ...] = (
 
 log = logging.getLogger("gia_that")
 
+# Giá khởi điểm "sát thực tế" cho thị trường giả lập khi không gọi được Binance lúc khởi động.
+# Chỉ là mốc tham khảo (không cập nhật tự động); mô phỏng chỉ dùng lợi suất % nên mốc giá
+# không ảnh hưởng tới lãi/lỗ, phí hay Fitness.
+REALISTIC_FALLBACK_PRICES: dict[str, float] = {
+    "BTCUSDT": 82000.0,
+    "ETHUSDT": 2400.0,
+    "BNBUSDT": 600.0,
+    "SOLUSDT": 180.0,
+    "XRPUSDT": 0.6,
+}
+DEFAULT_FALLBACK_PRICE = 100.0
+
+
+def get_smart_fallback_price(symbol: str) -> float:
+    """Giá khởi điểm giả lập theo cặp; cặp chưa có trong bảng → ``DEFAULT_FALLBACK_PRICE``."""
+    return REALISTIC_FALLBACK_PRICES.get(symbol.upper(), DEFAULT_FALLBACK_PRICE)
+
+
+def format_price(price: float) -> str:
+    """Định dạng giá có dấu phân cách nghìn; giá nhỏ giữ thêm chữ số (0.6 → ``0.6000``, không thành ``0.60``)."""
+    magnitude = abs(price)
+    if magnitude >= 1 or magnitude == 0:
+        decimals = 2
+    elif magnitude >= 0.01:
+        decimals = 4
+    else:
+        decimals = 8
+    return f"{price:,.{decimals}f}"
+
 
 class LivePriceUnavailable(RuntimeError):
     """Không lấy được giá khởi điểm nên không thể bắt đầu chế độ giá thật."""
@@ -191,8 +220,8 @@ class LiveMarketFeed:
             price = self._simulated_price(last)
             self.regime = "gia_lap_du_phong"
             log.warning(
-                "⚠️  Tick %d: không lấy được giá %s, dùng giá giả lập %.2f (lỗi liên tiếp %d lần)",
-                self.tick, self.symbol, price, self.stale_streak,
+                "⚠️  Tick %d: không lấy được giá %s, dùng giá giả lập %s (lỗi liên tiếp %d lần)",
+                self.tick, self.symbol, format_price(price), self.stale_streak,
             )
         else:
             if self.stale_streak:
@@ -205,7 +234,7 @@ class LiveMarketFeed:
         del self.prices[:-keep]
         del self.returns[:-keep]
         self._snapshot = self._build_snapshot()
-        log.debug("Tick %d: giá %s = %.2f", self.tick, self.symbol, price)
+        log.debug("Tick %d: giá %s = %s", self.tick, self.symbol, format_price(price))
         return self._snapshot
 
 
@@ -216,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
     if price is None:
         print(f"Không lấy được giá {symbol.upper()}.")
         return 1
-    print(f"Giá {symbol.upper()} hiện tại: {price:,.2f}")
+    print(f"Giá {symbol.upper()} hiện tại: {format_price(price)}")
     return 0
 
 

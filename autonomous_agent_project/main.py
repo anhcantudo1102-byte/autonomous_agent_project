@@ -25,7 +25,13 @@ from typing import Any
 from core import checkpoint as ckpt
 from core.agent import FITNESS_THRESHOLD, INITIAL_CAPITAL, Agent, GeneticConfig, GeneticController
 from core.memory import MemoryBank
-from core.price_feed import LiveMarketFeed, LivePriceUnavailable
+from core.price_feed import (
+    REALISTIC_FALLBACK_PRICES,
+    LiveMarketFeed,
+    LivePriceUnavailable,
+    format_price,
+    get_smart_fallback_price,
+)
 from core.strategy import TEN_CHE_DO, MarketSimulator, SimulatedExecutionEngine, StrategyParams
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -55,15 +61,20 @@ class Ecosystem:
             try:
                 self.market = LiveMarketFeed(args.symbol, rng=market_rng)
             except LivePriceUnavailable as e:
-                log.warning("⚠️  %s — chuyển sang thị trường GIẢ LẬP để tiếp tục chạy.", e)
-                self.market = MarketSimulator(market_rng)
-                self.price_source = f"giả lập (dự phòng vì không lấy được giá {args.symbol.upper()})"
+                symbol = args.symbol.upper()
+                start = get_smart_fallback_price(symbol)
+                note = "" if symbol in REALISTIC_FALLBACK_PRICES else " (chưa có mốc giá cho cặp này, dùng mặc định)"
+                log.warning("[Cảnh báo] Không thể kết nối Binance API. Kích hoạt chế độ giả lập với giá khởi điểm "
+                            "thực tế: %s cho %s%s. Chi tiết: %s", format_price(start), symbol, note, e)
+                self.market = MarketSimulator(market_rng, start_price=start)
+                self.price_source = f"giả lập (dự phòng vì không lấy được giá {symbol})"
             else:
                 self.price_source = f"Binance {self.market.symbol} (thật)"
-                log.info("🌐 Chế độ giá thật: %s từ Binance, giá khởi điểm %.2f",
-                         self.market.symbol, self.market.start_price)
+                log.info("[Thành công] Đã lấy giá thật từ Binance: %s (%s)",
+                         format_price(self.market.start_price), self.market.symbol)
         else:
             self.market = MarketSimulator(market_rng)
+        self.symbol = args.symbol.upper() if args.live_price else None
         self.engine = SimulatedExecutionEngine(random.Random(self.rng.random()))
         self._next_id = 1
         self.agents: list[Agent] = []
@@ -324,10 +335,10 @@ class Ecosystem:
         gens = max((ag.generation for ag in self.agents), default=0)
         best = max((ag.fitness().score for ag in self.agents), default=0.0)
         log.info(
-            "📊 Tick %4d | giá %8.2f | chế độ %-11s | sống %2d, chết %2d | tổng vốn $%7.2f | "
+            "📊 Tick %4d | giá %8s | chế độ %-11s | sống %2d, chết %2d | tổng vốn $%7.2f | "
             "thế hệ cao nhất %d | quy tắc %d (%d hiệu lực) | Fitness tốt nhất %.2f | đa dạng gen %.3f | "
             "biên độ đột biến %.2f",
-            step, snap.price, TEN_CHE_DO[snap.regime], len(self.agents), len(self.graveyard),
+            step, format_price(snap.price), TEN_CHE_DO[snap.regime], len(self.agents), len(self.graveyard),
             total, gens, mem["quy_tac"], mem["quy_tac_hieu_luc"], best, self.genetics.diversity(),
             self.genetics.mutation_rate(step),
         )
