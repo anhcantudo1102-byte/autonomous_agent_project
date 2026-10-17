@@ -370,6 +370,15 @@ class TestProductionFitness(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.fit([], blown_ratio=1.0)
 
+    def test_chi_phi_ngoai_lenh(self):
+        self.assertEqual(self.fit([], other_costs=0.0), 20.0)
+        self.assertEqual(self.fit([], other_costs=2.0), 18.0)  # đứng ngoài vẫn trả chi phí vận hành
+        self.assertEqual(self.fit([T(1.0, "BUY", 3.0)], other_costs=0.5), 20.52)
+        self.assertEqual(self.fit([], other_costs=25.0), 0.004)  # chi phí làm cháy tài khoản
+        for bad in (-1, float("nan"), float("inf"), "1", True, None):
+            with self.subTest(other_costs=bad), self.assertRaises(ValueError):
+                self.fit([], other_costs=bad)
+
     def test_khop_ban_goc_khi_con_von_va_dd_nho(self):
         def goc(history, initial_capital=20.0):
             if not history:

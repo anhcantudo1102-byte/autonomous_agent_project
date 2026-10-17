@@ -238,10 +238,12 @@ def calculate_production_fitness(
     drawdown_penalty_rate: float = PRODUCTION_DRAWDOWN_PENALTY_RATE,
     floor: float = PRODUCTION_FLOOR,
     blown_ratio: float = PRODUCTION_BLOWN_RATIO,
+    other_costs: float = 0.0,
 ) -> float:
     """Fitness "thương mại": giá trị danh mục thực, điều chỉnh nhẹ theo kỷ luật hợp lưu và Drawdown.
 
-    ``vốn cuối = initial_capital + tổng pnl``. Nếu ``vốn cuối > 0``::
+    ``vốn cuối = initial_capital + tổng pnl − other_costs`` (``other_costs``: chi phí ngoài lệnh đã trả, vd chi phí
+    vận hành mỗi tick; mặc định 0). Nếu ``vốn cuối > 0``::
 
         điểm = vốn cuối
              + aligned_bonus_rate × vốn ban đầu × (số lệnh thuận chiều, |score| ≥ strong_threshold)
@@ -260,7 +262,8 @@ def calculate_production_fitness(
     Dùng dạng hữu tỷ thay cho ``exp`` vì ``exp`` tràn dưới về 0 khi lỗ rất sâu. Nhánh này không làm tròn
     (để các giá trị rất nhỏ vẫn phân biệt được); nhánh còn lại làm tròn 6 chữ số.
 
-    Quy ước chung với hai hàm trên: chưa có lệnh → đúng ``initial_capital``; ``action`` không phân biệt hoa
+    Quy ước chung với hai hàm trên: chưa có lệnh và ``other_costs == 0`` → đúng ``initial_capital`` (có chi phí thì
+    tính như trên với tổng pnl = 0, để đứng ngoài không được miễn chi phí); ``action`` không phân biệt hoa
     thường, ``LONG``/``SHORT``/``STRONG_*`` được chấp nhận, ``HOLD``/lạ → chỉ tính pnl; ``pnl``/``score``
     thiếu hoặc ``None`` → 0 / không thưởng-phạt; dict hoặc đối tượng; số không hợp lệ, NaN, vô cực,
     ``initial_capital`` ≤ 0 hoặc tham số âm → ``ValueError``. ``agent`` chưa được dùng.
@@ -273,11 +276,15 @@ def calculate_production_fitness(
     _validate_non_negative(strong_threshold=strong_threshold, aligned_bonus_rate=aligned_bonus_rate,
                            counter_penalty_rate=counter_penalty_rate, drawdown_threshold=drawdown_threshold,
                            drawdown_penalty_rate=drawdown_penalty_rate, floor=floor, blown_ratio=blown_ratio)
+    valid = isinstance(other_costs, (int, float)) and not isinstance(other_costs, bool)
+    if not (valid and math.isfinite(other_costs) and other_costs >= 0):
+        raise ValueError(f"Tham số 'other_costs' phải là số hữu hạn ≥ 0, nhận {other_costs!r}")
+    costs = float(other_costs)
     if blown_ratio >= 1:
         raise ValueError(f"blown_ratio phải < 1 để agent cháy tài khoản luôn dưới sàn, nhận {blown_ratio!r}")
 
     trades = list(trade_history or ())
-    if not trades:
+    if not trades and costs == 0:
         return capital
 
     pnls: list[float] = []
@@ -295,7 +302,7 @@ def calculate_production_fitness(
             continue
         adjustment += aligned_bonus_rate * capital if direction * score > 0 else -counter_penalty_rate * capital
 
-    portfolio = capital + sum(pnls)
+    portfolio = capital + sum(pnls) - costs
     if portfolio <= 0:
         return floor * blown_ratio / (1.0 + abs(portfolio) / capital)
 

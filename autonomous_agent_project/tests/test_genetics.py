@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace as dc_replace
 from pathlib import Path
+from unittest import mock
 
 from core.agent import (
     DRAWDOWN_FLOOR,
@@ -218,6 +220,87 @@ class TestGeneticController(GeneticTestCase):
         self.assertIs(weak.strategy.params, weak.params)
         self.assertEqual(weak.stats.niche_shifts, 1)
         self.assertEqual(gc.enforce_diversity(tick=4), [])
+
+
+def csnap(tick: int, score: float | None):
+    return dc_replace(snap(tick=tick), confluence=score)
+
+
+class TestProductionEliteFitness(GeneticTestCase):
+    """Lịch sử lệnh có điểm hợp lưu, Agent.production_fitness() và tinh hoa theo hàm fitness tuỳ chọn."""
+
+    def trader(self, pnls: list[float], cost: float = 0.1) -> Agent:
+        return Agent("A-001", self.memory, PARAMS, engine=ScriptedEngine(pnls), rng=rng(1), operating_cost=cost)
+
+    def test_chi_ghi_lich_su_khi_co_diem_hop_luu(self) -> None:
+        plain = self.trader([2.0, -1.0])
+        for t in range(1, 4):
+            plain.step(snap(tick=t))
+        self.assertEqual(plain.stats.trades, 2)
+        self.assertEqual(plain.trade_history, [])
+        self.assertNotIn("confluence_score", plain.position.context)
+
+        ag = self.trader([2.0, -1.0])
+        for t, score in ((1, 3.0), (2, -0.4), (3, 1.0)):
+            ag.step(csnap(t, score))
+        self.assertEqual(ag.trade_history, [
+            {"pnl": 2.0, "action": "LONG", "confluence_score": 3.0},
+            {"pnl": -1.0, "action": "LONG", "confluence_score": -0.4},
+        ])
+        self.assertEqual(ag.position.context["confluence_score"], 1.0)
+
+    def test_production_fitness_tru_chi_phi_van_hanh(self) -> None:
+        ag = self.trader([2.0, -1.0])
+        for t in range(1, 4):
+            ag.step(csnap(t, 3.0))
+        # 20 + (2 − 1) − 3 × 0.1 chi phí vận hành + 2 lệnh thuận chiều × 0.1% × 20 = 20.74
+        self.assertAlmostEqual(ag.equity, 20.7)
+        self.assertEqual(ag.production_fitness(), 20.74)
+        idle = self.trader([], cost=0.1)
+        for t in range(1, 4):
+            idle.stats.operating_cost += 0.1  # đứng ngoài vẫn phải trả chi phí vận hành
+        self.assertEqual(idle.production_fitness(), 19.7)
+        self.assertEqual(self.trader([], cost=0.0).production_fitness(), 20.0)
+
+    def test_checkpoint_luu_lich_su_va_tuong_thich_ban_cu(self) -> None:
+        ag = self.trader([2.0, -1.0])
+        for t in range(1, 4):
+            ag.step(csnap(t, 3.0))
+        state = ag.to_state()
+        back = Agent.from_state(state, self.memory)
+        self.assertEqual(back.trade_history, ag.trade_history)
+        self.assertEqual(back.production_fitness(), ag.production_fitness())
+
+        old = {k: v for k, v in state.items() if k != "trade_history"}
+        legacy = Agent.from_state(old, self.memory)
+        self.assertEqual(legacy.trade_history, [{"pnl": 1.0, "action": None, "confluence_score": None}])
+        self.assertEqual(legacy.production_fitness(), 20.7)  # đúng giá trị danh mục, mất thưởng/DD từng lệnh
+        fresh = Agent.from_state({**old, "stats": {**state["stats"], "trades": 0}}, self.memory)
+        self.assertEqual(fresh.trade_history, [])
+
+    def ranked_agents(self) -> list[Agent]:
+        strong = self.make_agent("A-001", params=StrategyParams(leverage=1.0))
+        mid = self.make_agent("A-002", params=StrategyParams(leverage=5.0, contrarian=True))
+        weak = self.make_agent("A-003", params=StrategyParams(leverage=3.0, position_fraction=0.1))
+        for ag, pnls in ((strong, [10.0, 9.0]), (mid, [8.0, 0.5]), (weak, [-5.0, 1.0])):
+            ag.engine = ScriptedEngine(pnls)
+            self.play(ag, 3)
+        return [strong, mid, weak]
+
+    def test_tinh_hoa_xep_theo_ham_tuy_chon_nhung_cong_van_theo_agent_fitness(self) -> None:
+        strong, mid, weak = agents = self.ranked_agents()
+        custom = {"A-001": 1.0, "A-002": 5.0, "A-003": 99.0}
+        gc = GeneticController(self.memory, lambda: agents, rng(7), GeneticConfig(elite_size=2, crossover_prob=1.0),
+                               elite_fitness=lambda a: custom[a.agent_id])
+        self.assertEqual([a.agent_id for a in gc.elite(strong)], ["A-002", "A-001"])  # A-003 chưa qua cổng
+        self.assertEqual(gc.elite_score(weak), 99.0)
+        default = GeneticController(self.memory, lambda: agents, rng(7), GeneticConfig(elite_size=2))
+        self.assertEqual([a.agent_id for a in default.elite(strong)], ["A-001", "A-002"])
+        self.assertEqual(default.elite_score(strong), strong.fitness().score)
+
+        with mock.patch.object(StrategyParams, "crossover", wraps=StrategyParams.crossover) as cross:
+            gc.breed(strong, tick=4)
+        self.assertEqual(cross.call_args.args[2], [5.0, 1.0])
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from enum import Enum
 from typing import Any, Callable, Iterable
 
 from .checkpoint import restore_rng, rng_state
+from .evolution import calculate_production_fitness
 from .memory import MemoryBank, describe_context
 from .strategy import (
     Direction,
@@ -56,6 +57,7 @@ FITNESS_THRESHOLD = 1.5
 DRAWDOWN_FLOOR = 0.05
 STABILITY_PENALTY = 10.0
 STABILITY_WINDOW = 50
+CONFLUENCE_CONTEXT_KEY = "confluence_score"
 
 
 class AgentState(str, Enum):
@@ -149,6 +151,8 @@ class Agent:
         self._last_loss_context: dict[str, Any] | None = None
         self._trade_returns: deque[float] = deque(maxlen=STABILITY_WINDOW)
         self._fitness_gate_closed = False
+        # Lịch sử {pnl, action, confluence_score} của các lệnh mở khi có điểm hợp lưu (--advanced-analysis).
+        self.trade_history: list[dict[str, Any]] = []
         self.log = logging.getLogger(f"agent.{agent_id}")
 
     # ---------------------------------------------------------- Trạng thái
@@ -188,6 +192,16 @@ class Agent:
             stability=stability,
             win_rate=win_rate,
             return_std=std,
+        )
+
+    def production_fitness(self) -> float:
+        """``calculate_production_fitness`` trên lịch sử lệnh, trừ chi phí vận hành đã trả.
+
+        Vốn trao cho con không bị trừ (giống ``equity``), nên khi không có kẹp vốn:
+        ``vốn ban đầu + Σpnl − chi phí vận hành == equity``.
+        """
+        return calculate_production_fitness(
+            self, self.trade_history, self.initial_capital, other_costs=self.stats.operating_cost
         )
 
     def adopt_params(self, params: StrategyParams) -> None:
@@ -242,6 +256,12 @@ class Agent:
         if capital_before > 0:
             self._trade_returns.append(pnl / capital_before)
         self._update_equity()
+        if CONFLUENCE_CONTEXT_KEY in pos.context:
+            self.trade_history.append({
+                "pnl": round(pnl, 6),
+                "action": pos.order.direction.value,
+                "confluence_score": pos.context[CONFLUENCE_CONTEXT_KEY],
+            })
         if pnl >= 0:
             self.stats.wins += 1
             self.stats.loss_streak = 0
@@ -425,6 +445,8 @@ class Agent:
                 order.leverage,
             )
         context = RuleFilter.build_context(order, snapshot)
+        if snapshot.confluence is not None:
+            context[CONFLUENCE_CONTEXT_KEY] = snapshot.confluence
         self.position = self.engine.open_position(order, self.capital, snapshot, context)
 
     def describe(self) -> dict[str, Any]:
@@ -463,6 +485,7 @@ class Agent:
             "last_loss_context": self._last_loss_context,
             "trade_returns": list(self._trade_returns),
             "fitness_gate_closed": self._fitness_gate_closed,
+            "trade_history": [dict(t) for t in self.trade_history],
             "position": None if pos is None else {
                 "direction": pos.order.direction.value,
                 "fraction": pos.order.fraction,
@@ -504,6 +527,12 @@ class Agent:
         agent._last_loss_context = data.get("last_loss_context")
         agent._trade_returns.extend(float(r) for r in data.get("trade_returns", []))
         agent._fitness_gate_closed = bool(data.get("fitness_gate_closed", False))
+        if "trade_history" in data:
+            agent.trade_history = [dict(t) for t in data["trade_history"]]
+        elif agent.stats.trades:
+            # Checkpoint cũ chưa có lịch sử lệnh: gộp lãi lỗ đã thực hiện thành một lệnh không chiều
+            # để giá trị danh mục vẫn đúng (mất thông tin Max DD và điểm hợp lưu của từng lệnh).
+            agent.trade_history = [{"pnl": agent.stats.realized_pnl, "action": None, "confluence_score": None}]
         pos = data.get("position")
         if pos is not None and agent.is_alive:
             order = Order(Direction(pos["direction"]), float(pos["fraction"]), float(pos["leverage"]), pos.get("reason", ""))
@@ -587,11 +616,14 @@ class GeneticController:
         population: Callable[[], Iterable[Agent]],
         rng: random.Random,
         config: GeneticConfig | None = None,
+        elite_fitness: Callable[[Agent], float] | None = None,
     ) -> None:
         self.memory = memory
         self.population = population
         self.rng = rng
         self.config = config or GeneticConfig()
+        # Hàm xếp hạng/trọng số tinh hoa; None → Agent.fitness().score. Cổng vào tinh hoa luôn theo Agent.fitness().
+        self.elite_fitness = elite_fitness
         self.log = logging.getLogger("di_truyen")
 
     def active_agents(self) -> list[Agent]:
@@ -613,10 +645,15 @@ class GeneticController:
             high_pressure=c.high_failure_pressure,
         )
 
+    def elite_score(self, agent: Agent) -> float:
+        return agent.fitness().score if self.elite_fitness is None else self.elite_fitness(agent)
+
     def elite(self, parent: Agent) -> list[Agent]:
-        """Top agent có Fitness cao nhất (đạt ngưỡng); luôn bao gồm agent đang sinh sản."""
+        """Top agent (đạt ngưỡng ``Agent.fitness()``) xếp theo ``elite_score``; luôn gồm agent đang sinh sản."""
         scored = [(a.fitness().score, a) for a in self.active_agents()]
         qualified = [(s, a) for s, a in scored if s >= a.fitness_threshold and s > 0]
+        if self.elite_fitness is not None:
+            qualified = [(self.elite_fitness(a), a) for _, a in qualified]
         qualified.sort(key=lambda sa: sa[0], reverse=True)
         top = [a for _, a in qualified[: self.config.elite_size]]
         if parent not in top:
@@ -635,7 +672,7 @@ class GeneticController:
         )
         elite = self.elite(parent)
         if len(elite) >= 2 and self.rng.random() < c.crossover_prob:
-            weights = [max(a.fitness().score, 1e-6) for a in elite]
+            weights = [max(self.elite_score(a), 1e-6) for a in elite]
             base = StrategyParams.crossover([a.params for a in elite], self.rng, weights)
             method, ids = "lai_ghep", tuple(a.agent_id for a in elite)
         else:
