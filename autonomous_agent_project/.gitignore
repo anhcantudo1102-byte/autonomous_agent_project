@@ -4,6 +4,9 @@ data/*.lock
 data/.memory_*.tmp
 !data/.gitkeep
 
+# Checkpoint quần thể sinh ra khi chạy main.py / evolution_demo.py
+checkpoints/
+
 __pycache__/
 *.pyc
 .pytest_cache/

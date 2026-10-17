@@ -4,19 +4,23 @@ Ví dụ:
     python main.py                         # 500 bước, 5 agent, tick 0.05 giây (giá giả lập)
     python main.py --steps 600 --tick 0 --seed 7 --reset-memory
     python main.py --live-price --symbol ETHUSDT --steps 300   # giá thật từ Binance, tick 2 giây
+    python main.py --steps 200 --checkpoint-every 50           # lưu checkpoint mỗi 50 tick và khi Ctrl+C
+    python main.py --steps 200 --resume                        # chạy tiếp 200 tick từ checkpoint
 """
 
 from __future__ import annotations
 
 import argparse
-import itertools
 import logging
 import random
 import signal
+import statistics
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
+from core import checkpoint as ckpt
 from core.agent import FITNESS_THRESHOLD, INITIAL_CAPITAL, Agent, GeneticConfig, GeneticController
 from core.memory import MemoryBank
 from core.price_feed import LiveMarketFeed, LivePriceUnavailable
@@ -24,6 +28,8 @@ from core.strategy import TEN_CHE_DO, MarketSimulator, SimulatedExecutionEngine,
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_MEMORY = PROJECT_DIR / "data" / "memory_bank.json"
+DEFAULT_CHECKPOINT = ckpt.CHECKPOINT_DIR / "ecosystem_checkpoint.json"
+CHECKPOINT_FIELDS = ("tick", "next_id", "rng", "market", "agents", "graveyard")
 DEFAULT_TICK_SIMULATED = 0.05
 DEFAULT_TICK_LIVE = 2.0
 
@@ -56,11 +62,16 @@ class Ecosystem:
         else:
             self.market = MarketSimulator(market_rng)
         self.engine = SimulatedExecutionEngine(random.Random(self.rng.random()))
-        self._ids = itertools.count(1)
+        self._next_id = 1
         self.agents: list[Agent] = []
         self.graveyard: list[Agent] = []
         self._newborns: list[Agent] = []
         self._stop = False
+        self.start_tick = 0
+        self.current_tick = 0
+        self._saved_tick: int | None = None
+        self.best_agent: dict[str, Any] | None = None
+        self.checkpointing = args.checkpoint_every > 0 or args.resume
         self.genetics = GeneticController(
             self.memory,
             lambda: [*self.agents, *self._newborns],
@@ -72,11 +83,133 @@ class Ecosystem:
                 min_genome_distance=args.min_diversity,
             ),
         )
+        if args.resume and self._resume():
+            return
         for _ in range(args.agents):
             self.agents.append(self._spawn_genesis())
 
     def next_id(self) -> str:
-        return f"A-{next(self._ids):03d}"
+        agent_id = f"A-{self._next_id:03d}"
+        self._next_id += 1
+        return agent_id
+
+    # ------------------------------------------------------------ Checkpoint
+    def _update_best(self) -> None:
+        """Giữ BẢN SAO trạng thái agent có Fitness cao nhất từng ghi nhận (không phải tham chiếu)."""
+        for ag in self.agents:
+            score = ag.fitness().score
+            if self.best_agent is None or score > self.best_agent["fitness"]["score"]:
+                self.best_agent = ag.describe() | {"tick_ghi_nhan": self.current_tick}
+
+    def _fitness_stats(self) -> dict[str, Any]:
+        scores = [ag.fitness().score for ag in self.agents]
+        return {
+            "so_agent_song": len(scores),
+            "tot_nhat": round(max(scores), 6) if scores else None,
+            "trung_binh": round(statistics.fmean(scores), 6) if scores else None,
+            "trung_vi": round(statistics.median(scores), 6) if scores else None,
+            "the_he_cao_nhat": max((ag.generation for ag in self.agents), default=0),
+            "da_dang_gen": round(self.genetics.diversity(), 6),
+        }
+
+    def _market_state(self) -> dict[str, Any]:
+        m = self.market
+        state: dict[str, Any] = {
+            "type": "live" if isinstance(m, LiveMarketFeed) else "simulator",
+            "tick": m.tick,
+            "regime": m.regime,
+            "prices": list(m.prices),
+            "returns": list(m.returns),
+        }
+        if isinstance(m, LiveMarketFeed):
+            state["symbol"] = m.symbol
+        return state
+
+    def save_checkpoint(self) -> Path | None:
+        """Ghi atomic trạng thái quần thể ra ``--checkpoint-file``. Lỗi ghi chỉ cảnh báo, không dừng mô phỏng."""
+        self.memory.flush()
+        self._update_best()
+        data = {
+            "tick": self.current_tick,
+            "next_id": self._next_id,
+            "seed": self.args.seed,
+            "price_source": self.price_source,
+            "memory_file": str(self.args.memory),
+            "rng": {
+                "ecosystem": ckpt.rng_state(self.rng),
+                "market": ckpt.rng_state(self.market.rng),
+                "engine": ckpt.rng_state(self.engine.rng),
+                "genetics": ckpt.rng_state(self.genetics.rng),
+            },
+            "market": self._market_state(),
+            "fitness_stats": self._fitness_stats(),
+            "best_agent": self.best_agent,
+            "agents": [ag.to_state() for ag in self.agents],
+            "graveyard": [ag.to_state() for ag in self.graveyard],
+        }
+        try:
+            path = ckpt.write_checkpoint(self.args.checkpoint_file, ckpt.KIND_ECOSYSTEM, data,
+                                         durable=not self.args.no_fsync)
+        except ckpt.CheckpointError as e:
+            log.warning("⚠️  %s", e)
+            return None
+        self._saved_tick = self.current_tick
+        log.info("💾 Checkpoint tick %d: %d agent sống, %d đã chết → %s",
+                 self.current_tick, len(self.agents), len(self.graveyard), path)
+        return path
+
+    def _resume(self) -> bool:
+        """Khôi phục từ ``--checkpoint-file``. Trả về False (khởi tạo mới) nếu không có tệp hoặc tệp hỏng."""
+        path = self.args.checkpoint_file
+        if not Path(path).exists():
+            log.warning("⚠️  Không có checkpoint tại %s — khởi tạo quần thể mới.", path)
+            return False
+        data = ckpt.load_or_quarantine(path, ckpt.KIND_ECOSYSTEM, CHECKPOINT_FIELDS, report=log.warning)
+        if data is None:
+            return False
+        try:
+            agents = [Agent.from_state(s, self.memory, self.engine) for s in data["agents"]]
+            graveyard = [Agent.from_state(s, self.memory, self.engine) for s in data["graveyard"]]
+            rngs = data["rng"]
+            restored = {name: ckpt.restore_rng(rngs[name]) for name in ("ecosystem", "market", "engine", "genetics")}
+            market = data["market"]
+            tick, next_id = int(data["tick"]), int(data["next_id"])
+        except (KeyError, TypeError, ValueError) as e:
+            backup = ckpt.quarantine(path)
+            log.warning("⚠️  Checkpoint %s sai cấu trúc (%s: %s), đã chuyển sang %s — khởi tạo quần thể mới.",
+                        path, type(e).__name__, e, backup)
+            return False
+        if not any(ag.is_alive for ag in agents):
+            log.warning("⚠️  Quần thể trong checkpoint %s đã diệt vong — khởi tạo quần thể mới.", path)
+            return False
+
+        for name, target in (("ecosystem", self.rng), ("engine", self.engine.rng), ("genetics", self.genetics.rng)):
+            target.setstate(restored[name].getstate())
+        m = self.market
+        m.tick = int(market["tick"])
+        same_kind = (market["type"] == "live") == isinstance(m, LiveMarketFeed)
+        if same_kind and not isinstance(m, LiveMarketFeed):
+            m.rng.setstate(restored["market"].getstate())
+            m.regime = market["regime"]
+            m.prices = [float(p) for p in market["prices"]]
+            m.returns = [float(r) for r in market["returns"]]
+        m._snapshot = m._build_snapshot()
+        self.agents = [ag for ag in agents if ag.is_alive]
+        self.graveyard = graveyard + [ag for ag in agents if not ag.is_alive]
+        self._next_id = next_id
+        self.start_tick = self.current_tick = tick
+        self.best_agent = data.get("best_agent")
+        stats = data.get("fitness_stats") or {}
+        log.info(
+            "♻️  Khôi phục checkpoint %s (lưu lúc %s): tick %d, %d agent sống, %d đã chết, thế hệ cao nhất %s, "
+            "Fitness tốt nhất %s. Trạng thái ngẫu nhiên lấy từ checkpoint (bỏ qua --seed).",
+            path, data.get("timestamp", "?"), tick, len(self.agents), len(self.graveyard),
+            stats.get("the_he_cao_nhat", "?"), stats.get("tot_nhat", "?"),
+        )
+        if not same_kind:
+            log.warning("⚠️  Checkpoint dùng nguồn giá '%s', lần này nguồn giá khác — giữ chuỗi giá hiện tại.",
+                        market["type"])
+        return True
 
     def _spawn_genesis(self) -> Agent:
         agent = Agent(
@@ -119,8 +252,12 @@ class Ecosystem:
             self.price_source,
             a.memory, mem["quy_tac"], mem["cai_chet"],
         )
-        step = 0
-        for step in range(1, a.steps + 1):
+        if self.checkpointing:
+            log.info("💾 Checkpoint: %s (mỗi %s tick và khi kết thúc/Ctrl+C)%s",
+                     a.checkpoint_file, a.checkpoint_every or "—",
+                     f", tiếp tục từ tick {self.start_tick}" if self.start_tick else "")
+        last = self.start_tick + a.steps
+        for step in range(self.start_tick + 1, last + 1):
             if self._stop:
                 break
             snap = self.market.step()
@@ -137,17 +274,22 @@ class Ecosystem:
             if a.diversity_every > 0 and step % a.diversity_every == 0:
                 self.genetics.enforce_diversity(step)
 
-            if step % a.summary_every == 0 or step == a.steps:
+            self.current_tick = step
+            if step % a.summary_every == 0 or step == last:
                 self._print_status(step, snap)
             if not self.agents:
                 log.warning("☠️  Toàn bộ hệ sinh thái đã diệt vong tại tick %d.", step)
                 break
-            if step % 20 == 0:
+            if a.checkpoint_every > 0 and step % a.checkpoint_every == 0:
+                self.save_checkpoint()
+            elif step % 20 == 0:
                 self.memory.flush()
-            if a.tick > 0:
+            if a.tick > 0 and not self._stop:
                 time.sleep(a.tick)
         self.memory.flush()
-        self._print_report(step)
+        if self.checkpointing and self._saved_tick != self.current_tick:
+            self.save_checkpoint()
+        self._print_report(self.current_tick)
         return 0
 
     def _print_status(self, step: int, snap) -> None:
@@ -226,6 +368,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Dùng giá thị trường thật từ Binance thay cho thị trường giả lập (lệnh vẫn là mô phỏng)")
     p.add_argument("--symbol", type=str, default="BTCUSDT",
                    help="Cặp giao dịch khi bật --live-price (ví dụ: BTCUSDT, ETHUSDT)")
+    p.add_argument("--checkpoint-every", type=int, default=0,
+                   help="Lưu checkpoint quần thể sau mỗi N tick, kèm một lần khi kết thúc/Ctrl+C (0 = tắt)")
+    p.add_argument("--checkpoint-file", type=Path, default=DEFAULT_CHECKPOINT,
+                   help="Tệp checkpoint quần thể (tách biệt với bộ nhớ chung)")
+    p.add_argument("--resume", action="store_true",
+                   help="Khôi phục quần thể từ --checkpoint-file rồi chạy tiếp --steps tick; "
+                        "không có tệp hoặc tệp hỏng thì khởi tạo mới")
     p.add_argument("--no-fsync", action="store_true", help="Bỏ fsync khi ghi (nhanh hơn, kém bền hơn)")
     verbosity = p.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true", help="In chi tiết từng lệnh/Post-Mortem")
@@ -240,6 +389,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.elite_size < 1 or not 0 <= args.crossover_prob <= 1 or args.min_diversity < 0 or args.diversity_every < 0:
         p.error("Tham số di truyền không hợp lệ: elite-size ≥ 1, 0 ≤ crossover-prob ≤ 1, "
                 "min-diversity ≥ 0, diversity-every ≥ 0")
+    if args.checkpoint_every < 0:
+        p.error("Tham số không hợp lệ: --checkpoint-every phải ≥ 0")
+    if args.resume and args.reset_memory:
+        p.error("Không dùng --resume cùng --reset-memory: quần thể khôi phục sẽ lệch với bộ nhớ chung đã bị xoá")
     return args
 
 

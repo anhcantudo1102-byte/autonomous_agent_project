@@ -28,11 +28,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Iterable
 
+from .checkpoint import restore_rng, rng_state
 from .memory import MemoryBank, describe_context
 from .strategy import (
+    Direction,
     DiversityResult,
     ExecutionEngine,
     MarketSnapshot,
+    Order,
     Position,
     RuleFilter,
     SimulatedExecutionEngine,
@@ -436,6 +439,84 @@ class Agent:
             "thong_ke": self.stats.to_dict(),
             "nguyen_nhan_chet": self.death_cause,
         }
+
+    # -------------------------------------------------------- Checkpoint
+    def to_state(self) -> dict[str, Any]:
+        """Toàn bộ trạng thái cần để khôi phục agent y hệt (dạng JSON được)."""
+        pos = self.position
+        return {
+            "id": self.agent_id,
+            "generation": self.generation,
+            "parent_id": self.parent_id,
+            "state": self.state.value,
+            "capital": self.capital,
+            "initial_capital": self.initial_capital,
+            "operating_cost": self.operating_cost,
+            "birth_tick": self.birth_tick,
+            "mutation_rate": self.mutation_rate,
+            "fitness_threshold": self.fitness_threshold,
+            "params": self.params.to_dict(),
+            "stats": dict(self.stats.__dict__),
+            "fitness": self.fitness().to_dict(),
+            "death_cause": self.death_cause,
+            "death_tick": self.death_tick,
+            "last_loss_context": self._last_loss_context,
+            "trade_returns": list(self._trade_returns),
+            "fitness_gate_closed": self._fitness_gate_closed,
+            "position": None if pos is None else {
+                "direction": pos.order.direction.value,
+                "fraction": pos.order.fraction,
+                "leverage": pos.order.leverage,
+                "reason": pos.order.reason,
+                "entry_price": pos.entry_price,
+                "entry_tick": pos.entry_tick,
+                "notional": pos.notional,
+                "margin": pos.margin,
+                "entry_fee": pos.entry_fee,
+                "context": pos.context,
+            },
+            "rng": rng_state(self.rng),
+        }
+
+    @classmethod
+    def from_state(cls, data: dict[str, Any], memory: MemoryBank, engine: ExecutionEngine | None = None) -> "Agent":
+        """Dựng lại agent từ ``to_state()``. Thiếu trường / sai kiểu → ``KeyError``/``ValueError``/``TypeError``."""
+        agent = cls(
+            str(data["id"]),
+            memory,
+            StrategyParams.from_dict(data["params"]),
+            capital=float(data["capital"]),
+            generation=int(data["generation"]),
+            parent_id=data.get("parent_id"),
+            engine=engine,
+            rng=restore_rng(data["rng"]) if data.get("rng") else None,
+            operating_cost=float(data["operating_cost"]),
+            birth_tick=int(data.get("birth_tick", 0)),
+            mutation_rate=float(data["mutation_rate"]),
+            fitness_threshold=float(data["fitness_threshold"]),
+        )
+        agent.initial_capital = float(data["initial_capital"])
+        agent.state = AgentState(data["state"])
+        known = AgentStats.__dataclass_fields__
+        agent.stats = AgentStats(**{k: v for k, v in data["stats"].items() if k in known})
+        agent.death_cause = data.get("death_cause")
+        agent.death_tick = data.get("death_tick")
+        agent._last_loss_context = data.get("last_loss_context")
+        agent._trade_returns.extend(float(r) for r in data.get("trade_returns", []))
+        agent._fitness_gate_closed = bool(data.get("fitness_gate_closed", False))
+        pos = data.get("position")
+        if pos is not None and agent.is_alive:
+            order = Order(Direction(pos["direction"]), float(pos["fraction"]), float(pos["leverage"]), pos.get("reason", ""))
+            agent.position = Position(
+                order,
+                float(pos["entry_price"]),
+                int(pos["entry_tick"]),
+                float(pos["notional"]),
+                float(pos["margin"]),
+                float(pos["entry_fee"]),
+                dict(pos.get("context") or {}),
+            )
+        return agent
 
 
 # ======================================================================
