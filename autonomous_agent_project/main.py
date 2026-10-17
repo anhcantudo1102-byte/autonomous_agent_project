@@ -8,6 +8,7 @@ Ví dụ:
     python main.py --steps 200 --resume                        # chạy tiếp 200 tick từ checkpoint
     python main.py --dashboard --tick 0.1                      # dashboard trực quan (cần rich)
     python main.py --live-dashboard                            # giá thật + dashboard, 30 bước, tick 2 giây
+    python main.py --advanced-analysis --seed 7 --tick 0       # thêm bộ lọc hợp lưu đa khung (SMC/Base/Elliott)
 """
 
 from __future__ import annotations
@@ -19,20 +20,23 @@ import signal
 import statistics
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from core import checkpoint as ckpt
+from core.advanced_strategy import ConfluenceFeed, describe_analysis
 from core.agent import FITNESS_THRESHOLD, INITIAL_CAPITAL, Agent, GeneticConfig, GeneticController
 from core.memory import MemoryBank
 from core.price_feed import (
     REALISTIC_FALLBACK_PRICES,
     LiveMarketFeed,
     LivePriceUnavailable,
+    fetch_klines,
     format_price,
     get_smart_fallback_price,
 )
-from core.strategy import TEN_CHE_DO, MarketSimulator, SimulatedExecutionEngine, StrategyParams
+from core.strategy import CONFLUENCE_WEIGHT_BOUNDS, TEN_CHE_DO, MarketSimulator, SimulatedExecutionEngine, StrategyParams
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_MEMORY = PROJECT_DIR / "data" / "memory_bank.json"
@@ -75,6 +79,17 @@ class Ecosystem:
         else:
             self.market = MarketSimulator(market_rng)
         self.symbol = args.symbol.upper() if args.live_price else None
+        self.analysis_feed: ConfluenceFeed | None = None
+        self.analysis: dict[str, Any] | None = None
+        if args.advanced_analysis:
+            fetch = None
+            if isinstance(self.market, LiveMarketFeed):
+                symbol = self.market.symbol
+                fetch = lambda interval, limit: fetch_klines(symbol, interval, limit, report=log.warning)  # noqa: E731
+            self.analysis_feed = ConfluenceFeed(
+                htf_ticks=args.htf_ticks, ltf_ticks=args.ltf_ticks, fetch=fetch,
+                htf_interval=args.htf_interval, ltf_interval=args.ltf_interval,
+            )
         self.engine = SimulatedExecutionEngine(random.Random(self.rng.random()))
         self._next_id = 1
         self.agents: list[Agent] = []
@@ -161,6 +176,8 @@ class Ecosystem:
             "agents": [ag.to_state() for ag in self.agents],
             "graveyard": [ag.to_state() for ag in self.graveyard],
         }
+        if self.analysis_feed is not None:
+            data["advanced"] = self.analysis_feed.to_state()
         try:
             path = ckpt.write_checkpoint(self.args.checkpoint_file, ckpt.KIND_ECOSYSTEM, data,
                                          durable=not self.args.no_fsync)
@@ -213,6 +230,14 @@ class Ecosystem:
         self._next_id = next_id
         self.start_tick = self.current_tick = tick
         self.best_agent = data.get("best_agent")
+        if self.analysis_feed is not None:
+            saved = data.get("advanced")
+            if isinstance(saved, dict):
+                self.analysis_feed.load_state(saved)
+                self.analysis = self.analysis_feed.last
+            else:
+                log.warning("⚠️  Checkpoint không có trạng thái phân tích đa khung — dựng lại nến từ tick tiếp theo.")
+            self._seed_confluence_genes()
         stats = data.get("fitness_stats") or {}
         log.info(
             "♻️  Khôi phục checkpoint %s (lưu lúc %s): tick %d, %d agent sống, %d đã chết, thế hệ cao nhất %s, "
@@ -225,11 +250,24 @@ class Ecosystem:
                         market["type"])
         return True
 
+    def _new_confluence_weight(self) -> float:
+        lo, hi = CONFLUENCE_WEIGHT_BOUNDS
+        return round(self.rng.uniform(lo, hi), 6)
+
+    def _seed_confluence_genes(self) -> None:
+        """Agent khôi phục từ checkpoint chưa có gen tin đa khung thì được gán ngẫu nhiên (chỉ khi bật phân tích)."""
+        for ag in self.agents:
+            if ag.params.confluence_weight is None:
+                ag.adopt_params(replace(ag.params, confluence_weight=self._new_confluence_weight()))
+
     def _spawn_genesis(self) -> Agent:
+        params = StrategyParams.random(self.rng)
+        if self.analysis_feed is not None:
+            params = replace(params, confluence_weight=self._new_confluence_weight())
         agent = Agent(
             self.next_id(),
             self.memory,
-            StrategyParams.random(self.rng),
+            params,
             capital=INITIAL_CAPITAL,
             engine=self.engine,
             rng=random.Random(self.rng.random()),
@@ -249,6 +287,8 @@ class Ecosystem:
             p.vol_tolerance * 100,
             ", đánh ĐẢO CHIỀU" if p.contrarian else "",
         )
+        if p.confluence_weight is not None:
+            log.info("   %s tin tín hiệu đa khung ở mức %.0f%%", agent.agent_id, p.confluence_weight * 100)
         return agent
 
     def request_stop(self, *_: object) -> None:
@@ -301,6 +341,9 @@ class Ecosystem:
             if self._stop:
                 break
             snap = self.market.step()
+            if self.analysis_feed is not None:
+                self.analysis = self.analysis_feed.update(snap.tick, snap.price)
+                snap = replace(snap, confluence=self.analysis["confluence_score"])
             newborns = self._newborns = []
             for agent in list(self.agents):
                 room = len(self.agents) + len(newborns) < a.max_agents
@@ -342,6 +385,13 @@ class Ecosystem:
             total, gens, mem["quy_tac"], mem["quy_tac_hieu_luc"], best, self.genetics.diversity(),
             self.genetics.mutation_rate(step),
         )
+        if self.analysis_feed is not None:
+            log.info("🧭 Tick %4d | %s (%s) | gen tin đa khung TB %s", step, describe_analysis(self.analysis),
+                     self.analysis_feed.source, self._avg_confluence_weight())
+
+    def _avg_confluence_weight(self) -> str:
+        weights = [ag.params.confluence_weight for ag in self.agents if ag.params.confluence_weight is not None]
+        return f"{statistics.fmean(weights):.2f}" if weights else "—"
 
     def _print_report(self, step: int) -> None:
         everyone = sorted(self.agents + self.graveyard, key=lambda ag: ag.agent_id)
@@ -363,6 +413,9 @@ class Ecosystem:
         print(f" Sống: {len(self.agents)} | Đã chết: {len(self.graveyard)} | "
               f"Tổng vốn còn lại: ${sum(ag.capital for ag in self.agents):.2f} | "
               f"Đa dạng gen: {self.genetics.diversity():.3f}")
+        if self.analysis_feed is not None:
+            print(f" Phân tích đa khung ({self.analysis_feed.source}): {describe_analysis(self.analysis)} | "
+                  f"gen tin đa khung TB của agent sống: {self._avg_confluence_weight()}")
         print(f" Bộ nhớ chung ({self.args.memory}): {mem['quy_tac']} quy tắc "
               f"({mem['quy_tac_hieu_luc']} hiệu lực), {mem['that_bai']} hồ sơ thất bại, "
               f"{mem['cai_chet']} hồ sơ cái chết, {mem['pha_he']} sự kiện sinh sản.")
@@ -414,6 +467,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "không có tệp hoặc tệp hỏng thì khởi tạo mới")
     p.add_argument("--dashboard", action="store_true",
                    help="Hiển thị dashboard trực quan trên terminal (cần thư viện rich; không có thì dùng log thường)")
+    p.add_argument("--advanced-analysis", action="store_true",
+                   help="Bật phân tích đa khung (SMC, Hidden Base, Elliott): điểm hợp lưu làm bộ lọc/thiên hướng "
+                        "vào lệnh, mức tin tưởng là một gen do GA tự học")
+    p.add_argument("--htf-ticks", type=int, default=8, help="Số tick gom thành một nến khung lớn (HTF)")
+    p.add_argument("--ltf-ticks", type=int, default=2, help="Số tick gom thành một nến khung nhỏ (LTF)")
+    p.add_argument("--htf-interval", type=str, default="1h",
+                   help="Khung nến Binance cho HTF khi dùng cùng --live-price")
+    p.add_argument("--ltf-interval", type=str, default="1m",
+                   help="Khung nến Binance cho LTF khi dùng cùng --live-price")
     p.add_argument("--no-fsync", action="store_true", help="Bỏ fsync khi ghi (nhanh hơn, kém bền hơn)")
     verbosity = p.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true", help="In chi tiết từng lệnh/Post-Mortem")
@@ -435,6 +497,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.elite_size < 1 or not 0 <= args.crossover_prob <= 1 or args.min_diversity < 0 or args.diversity_every < 0:
         p.error("Tham số di truyền không hợp lệ: elite-size ≥ 1, 0 ≤ crossover-prob ≤ 1, "
                 "min-diversity ≥ 0, diversity-every ≥ 0")
+    if args.htf_ticks < 1 or args.ltf_ticks < 1:
+        p.error("Tham số không hợp lệ: --htf-ticks và --ltf-ticks phải ≥ 1")
     if args.checkpoint_every < 0:
         p.error("Tham số không hợp lệ: --checkpoint-every phải ≥ 0")
     if args.resume and args.reset_memory:
