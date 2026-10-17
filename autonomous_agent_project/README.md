@@ -259,8 +259,19 @@ phỏng**, không có tiền thật nào được giao dịch.
 
 Cơ chế dự phòng khi API lỗi:
 
-* Không lấy được giá lúc khởi động (mất mạng, sai `--symbol`): in cảnh báo rồi chạy bằng thị trường
-  **giả lập**.
+* Không lấy được giá lúc khởi động (mất mạng, sai `--symbol`): chạy bằng thị trường **giả lập**, bắt
+  đầu ở giá sát thực tế của cặp đó (`REALISTIC_FALLBACK_PRICES` trong `core/price_feed.py`): BTCUSDT
+  82,000, ETHUSDT 2,400, BNBUSDT 600, SOLUSDT 180, XRPUSDT 0.6. Cặp khác bắt đầu từ 100. Ví dụ:
+
+  ```
+  [Cảnh báo] Không thể kết nối Binance API. Kích hoạt chế độ giả lập với giá khởi điểm thực tế: 82,000.00 cho BTCUSDT. Chi tiết: …
+  ```
+
+  Khi lấy được giá, chương trình in `[Thành công] Đã lấy giá thật từ Binance: 81,573.85 (BTCUSDT)`. Chế độ
+  giả lập mặc định (không có `--live-price`) vẫn bắt đầu từ 100, nên kết quả theo seed không đổi.
+  Mô phỏng chỉ dùng lợi suất %: lãi/lỗ, phí, trượt giá, động lượng và biến động đều tính theo tỷ lệ.
+  Vì vậy cùng seed, giá khởi điểm 82,000, 0.6 hay 100 cho ra cùng một quần thể. Giá dưới 1 hiển thị 4
+  chữ số thập phân (`0.6124`), dưới 0.01 thì 8 chữ số.
 * Lỗi giữa chừng: tick đó dùng **giá giả lập**, là một bước ngẫu nhiên từ giá cuối theo biến động gần
   đây. Dòng tóm tắt hiển thị chế độ `Giả lập (API lỗi)`. Khi API hoạt động lại, chương trình tự quay về
   giá thật.
@@ -289,7 +300,7 @@ from main import run_simulation_with_dashboard
 run_simulation_with_dashboard(symbol="BTCUSDT", steps=30, tick_interval=2, seed=7, checkpoint_every=10)
 ```
 
-Không lấy được giá lúc khởi động thì chuyển sang thị trường giả lập. Lỗi giữa chừng thì tick đó dùng
+Không lấy được giá lúc khởi động thì chuyển sang thị trường giả lập, bắt đầu ở giá sát thực tế của cặp. Lỗi giữa chừng thì tick đó dùng
 giá giả lập. Thiếu `rich` hoặc không phải terminal thì dùng log thường.
 
 Dashboard gồm bốn phần:
@@ -395,7 +406,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-Bộ test (127 ca, không cần mạng, không cần TTY) bao phủ: `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
+Bộ test (136 ca, không cần mạng, không cần TTY) bao phủ: giá khởi điểm dự phòng theo cặp và tính độc lập với thang giá (`tests/test_fallback_price.py`); `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
 chống trùng lặp gen và phân hoá ngách (`tests/test_genetics.py`); tự hủy (đúng ngưỡng $0.5, sau lệnh lỗ, chết đói, ngừng hoạt động sau khi chết), nhân
 bản (ngưỡng $40, trích $20, thế hệ/ID cha, đột biến trong biên, thừa kế bộ nhớ, trần quần thể), bộ lọc
 quy tắc (CAM, giảm quy mô, giới hạn đòn bẩy, ưu tiên, quy tắc hết hiệu lực, điều kiện sai định dạng),
