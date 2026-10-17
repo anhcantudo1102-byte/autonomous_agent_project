@@ -13,3 +13,6 @@ checkpoints/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Kết quả scripts/backtest_compare.py
+results/
