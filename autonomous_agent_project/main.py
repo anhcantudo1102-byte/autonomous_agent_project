@@ -6,6 +6,7 @@ Ví dụ:
     python main.py --live-price --symbol ETHUSDT --steps 300   # giá thật từ Binance, tick 2 giây
     python main.py --steps 200 --checkpoint-every 50           # lưu checkpoint mỗi 50 tick và khi Ctrl+C
     python main.py --steps 200 --resume                        # chạy tiếp 200 tick từ checkpoint
+    python main.py --dashboard --tick 0.1                      # dashboard trực quan (cần rich)
 """
 
 from __future__ import annotations
@@ -257,6 +258,32 @@ class Ecosystem:
                      a.checkpoint_file, a.checkpoint_every or "—",
                      f", tiếp tục từ tick {self.start_tick}" if self.start_tick else "")
         last = self.start_tick + a.steps
+        dashboard = self._start_dashboard() if a.dashboard else None
+        try:
+            self._run_ticks(last, dashboard)
+            self.memory.flush()
+            if self.checkpointing and self._saved_tick != self.current_tick:
+                self.save_checkpoint()
+        finally:
+            if dashboard is not None:
+                dashboard.stop()
+        self._print_report(self.current_tick)
+        return 0
+
+    def _start_dashboard(self):
+        """Bật dashboard rich; không được (chưa cài rich, không phải TTY) thì cảnh báo và chạy log thường."""
+        from core.dashboard import DashboardUnavailable, EcosystemDashboard
+
+        try:
+            dashboard = EcosystemDashboard(self)
+            dashboard.start()
+        except DashboardUnavailable as e:
+            log.warning("⚠️  Không bật được --dashboard: %s — chuyển sang log thường.", e)
+            return None
+        return dashboard
+
+    def _run_ticks(self, last: int, dashboard=None) -> None:
+        a = self.args
         for step in range(self.start_tick + 1, last + 1):
             if self._stop:
                 break
@@ -277,20 +304,17 @@ class Ecosystem:
             self.current_tick = step
             if step % a.summary_every == 0 or step == last:
                 self._print_status(step, snap)
-            if not self.agents:
-                log.warning("☠️  Toàn bộ hệ sinh thái đã diệt vong tại tick %d.", step)
-                break
-            if a.checkpoint_every > 0 and step % a.checkpoint_every == 0:
+            if a.checkpoint_every > 0 and step % a.checkpoint_every == 0 and self.agents:
                 self.save_checkpoint()
             elif step % 20 == 0:
                 self.memory.flush()
+            if dashboard is not None:
+                dashboard.update(step, snap, force=step == last or self._stop or not self.agents)
+            if not self.agents:
+                log.warning("☠️  Toàn bộ hệ sinh thái đã diệt vong tại tick %d.", step)
+                break
             if a.tick > 0 and not self._stop:
                 time.sleep(a.tick)
-        self.memory.flush()
-        if self.checkpointing and self._saved_tick != self.current_tick:
-            self.save_checkpoint()
-        self._print_report(self.current_tick)
-        return 0
 
     def _print_status(self, step: int, snap) -> None:
         total = sum(ag.total_assets(snap) for ag in self.agents)
@@ -375,6 +399,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--resume", action="store_true",
                    help="Khôi phục quần thể từ --checkpoint-file rồi chạy tiếp --steps tick; "
                         "không có tệp hoặc tệp hỏng thì khởi tạo mới")
+    p.add_argument("--dashboard", action="store_true",
+                   help="Hiển thị dashboard trực quan trên terminal (cần thư viện rich; không có thì dùng log thường)")
     p.add_argument("--no-fsync", action="store_true", help="Bỏ fsync khi ghi (nhanh hơn, kém bền hơn)")
     verbosity = p.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true", help="In chi tiết từng lệnh/Post-Mortem")
