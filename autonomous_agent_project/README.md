@@ -98,6 +98,7 @@ python main.py --memory /tmp/thi_nghiem.json --reset-memory --tick 0
 | `--checkpoint-file` | `checkpoints/ecosystem_checkpoint.json` | Tệp checkpoint (tách biệt với bộ nhớ chung) |
 | `--resume` | tắt | Khôi phục quần thể từ checkpoint rồi chạy tiếp `--steps` tick |
 | `--dashboard` | tắt | Dashboard trực quan trên terminal (cần `rich`; không có thì dùng log thường) |
+| `--live-dashboard` | tắt | Viết tắt: `--live-price --dashboard --steps 30 --tick 2` (cờ ghi rõ được ưu tiên) |
 | `--no-fsync` | tắt | Bỏ `fsync` khi ghi để chạy nhanh hơn (vẫn atomic nhờ `os.replace`) |
 | `-v` / `-q` | | Chi tiết hơn / chỉ cảnh báo |
 
@@ -275,7 +276,21 @@ pip install rich                                   # tuỳ chọn, chỉ cần c
 python main.py --dashboard --tick 0.05 --seed 7    # mô phỏng thật, hiển thị bằng dashboard
 python main.py --dashboard --checkpoint-every 100  # kèm checkpoint, Ctrl+C vẫn lưu
 python dashboard_demo.py --steps 40 --delay 0.3    # demo độc lập với dữ liệu giả
+python main.py --live-dashboard                    # giá thật Binance + dashboard, 30 bước, tick 2 giây
+python main.py --live-dashboard --symbol ETHUSDT --steps 100   # cờ ghi rõ được ưu tiên
 ```
+
+`--live-dashboard` là viết tắt của `--live-price --dashboard --steps 30 --tick 2 --symbol BTCUSDT`.
+Gọi từ Python thì dùng `run_simulation_with_dashboard`. Hàm này chạy mô phỏng thật: quần thể, agent
+tốt nhất và thế hệ đều lấy từ hệ sinh thái. Các tham số CLI khác truyền qua `kwargs`:
+
+```python
+from main import run_simulation_with_dashboard
+run_simulation_with_dashboard(symbol="BTCUSDT", steps=30, tick_interval=2, seed=7, checkpoint_every=10)
+```
+
+Không lấy được giá lúc khởi động thì chuyển sang thị trường giả lập. Lỗi giữa chừng thì tick đó dùng
+giá giả lập. Thiếu `rich` hoặc không phải terminal thì dùng log thường.
 
 Dashboard gồm bốn phần:
 
@@ -380,7 +395,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-Bộ test (120 ca, không cần mạng, không cần TTY) bao phủ: dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
+Bộ test (127 ca, không cần mạng, không cần TTY) bao phủ: `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
 chống trùng lặp gen và phân hoá ngách (`tests/test_genetics.py`); tự hủy (đúng ngưỡng $0.5, sau lệnh lỗ, chết đói, ngừng hoạt động sau khi chết), nhân
 bản (ngưỡng $40, trích $20, thế hệ/ID cha, đột biến trong biên, thừa kế bộ nhớ, trần quần thể), bộ lọc
 quy tắc (CAM, giảm quy mô, giới hạn đòn bẩy, ưu tiên, quy tắc hết hiệu lực, điều kiện sai định dạng),
