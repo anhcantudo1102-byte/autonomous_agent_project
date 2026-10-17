@@ -19,10 +19,13 @@ autonomous_agent_project/
 │   ├── strategy.py      # Thị trường, chiến lược, interface thực thi, bộ lọc quy tắc, toán tử gen
 │   ├── memory.py        # Reflexion: Post-Mortem, đúc kết quy tắc, ghi JSON atomic
 │   ├── price_feed.py    # Lấy giá/nến thật từ API công khai Binance (cần requests)
-│   └── advanced_strategy.py # MultiDimensionalAnalyzer: SMC + Elliott (heuristic) + Hidden Base
+│   ├── advanced_strategy.py # MultiDimensionalAnalyzer: SMC + Elliott (heuristic) + Hidden Base
+│   └── checkpoint.py    # Lưu/khôi phục checkpoint quần thể (atomic, có schema_version)
 ├── advanced_demo.py     # Demo phân tích đa khung thời gian (nến giả lập hoặc --live)
+├── evolution_demo.py    # Demo tiến hoá: chạy lại là tiếp tục từ thế hệ đã lưu
 ├── data/
 │   └── memory_bank.json # Bộ nhớ chung (tự tạo khi chạy, không commit)
+├── checkpoints/         # Checkpoint quần thể (tự tạo khi bật checkpoint, không commit)
 ├── tests/               # Unit test (unittest, tương thích pytest)
 └── requirements.txt     # requests (chỉ cho price_feed); mô phỏng dùng thư viện chuẩn
 ```
@@ -89,6 +92,9 @@ python main.py --memory /tmp/thi_nghiem.json --reset-memory --tick 0
 | `--summary-every` | 25 | In dòng tóm tắt sau mỗi N tick |
 | `--memory` | `data/memory_bank.json` | Đường dẫn tệp bộ nhớ chung |
 | `--reset-memory` | tắt | Xoá sạch bộ nhớ trước khi chạy |
+| `--checkpoint-every` | 0 (tắt) | Lưu checkpoint quần thể sau mỗi N tick, cộng một lần khi kết thúc/Ctrl+C |
+| `--checkpoint-file` | `checkpoints/ecosystem_checkpoint.json` | Tệp checkpoint (tách biệt với bộ nhớ chung) |
+| `--resume` | tắt | Khôi phục quần thể từ checkpoint rồi chạy tiếp `--steps` tick |
 | `--no-fsync` | tắt | Bỏ `fsync` khi ghi để chạy nhanh hơn (vẫn atomic nhờ `os.replace`) |
 | `-v` / `-q` | | Chi tiết hơn / chỉ cảnh báo |
 
@@ -259,6 +265,47 @@ Lưu ý: giá thật thay đổi rất ít giữa các tick vài giây, thườn
 Agent vì thế chủ yếu đứng ngoài thị trường và chịu chi phí vận hành. Nên dùng `--tick` lớn hơn, ví dụ
 30–60 giây, để mỗi tick có biến động đáng kể.
 
+## Checkpoint quần thể (`core/checkpoint.py`)
+
+Mặc định không có checkpoint, hành vi như cũ. Bật lên bằng cờ:
+
+```bash
+python main.py --steps 300 --tick 0 --seed 7 --checkpoint-every 50   # lưu tại tick 50, 100, … và khi Ctrl+C
+python main.py --steps 200 --tick 0 --resume                         # chạy tiếp tick 301 → 500
+```
+
+Checkpoint chứa toàn bộ quần thể: agent đang sống và đã chết, vốn, trạng thái, thế hệ, ID cha, tham số
+gen, thống kê, vị thế đang mở, lợi suất các lệnh gần nhất. Ngoài ra có tick hiện tại, bộ đếm ID, chuỗi
+giá của thị trường, thống kê Fitness của quần thể, bản sao agent tốt nhất từng ghi nhận, và trạng
+thái của mọi bộ sinh số ngẫu nhiên. Nhờ vậy, chạy 213 tick rồi `--resume` thêm 287 tick cho báo cáo
+cuối **giống hệt** chạy liền 500 tick cùng seed. Khi resume, `--seed` bị bỏ qua.
+
+* Ghi atomic: tệp tạm → `fsync` → `os.replace`. Ctrl+C hay mất điện giữa lúc ghi không làm hỏng
+  checkpoint cũ.
+* Có trường `schema_version`. Checkpoint của phiên bản mới hơn bị từ chối và giữ nguyên tệp.
+* Tệp hỏng hoặc sai cấu trúc được đổi tên thành `*.corrupt.json`, rồi chương trình khởi tạo quần thể
+  mới. `--resume` khi chưa có tệp cũng khởi tạo mới.
+* `memory_bank.json` vẫn là bộ nhớ riêng. `--resume` cần dùng cùng `--memory` với lần trước, và
+  không được dùng cùng `--reset-memory`.
+* Với `--live-price`, giá thật không "tua lại" được: chỉ tick và quần thể được khôi phục.
+
+Demo tối giản (bản đã sửa lỗi của `run_evolution_with_checkpoint`):
+
+```bash
+python evolution_demo.py           # thế hệ 1–5
+python evolution_demo.py           # khôi phục, chạy tiếp thế hệ 6–10
+python evolution_demo.py --reset   # bắt đầu lại
+```
+
+```
+[Checkpoint] Khôi phục thành công thế hệ 5 từ …/autonomous_agent_project/checkpoints/latest_checkpoint.json
+-> Tiếp tục tiến hóa từ thế hệ 6
+
+--- Đang chạy Thế hệ (Generation) 6 ---
+🌟 Gen tốt nhất hiện tại (ID: 0, ghi nhận ở thế hệ 6): Fitness = 7.0818, gen = [0.6099, 0.9816]
+[Checkpoint] Đã lưu thành công trạng thái thế hệ 6 vào …/checkpoints/latest_checkpoint.json
+```
+
 ## Phân tích đa khung thời gian (`core/advanced_strategy.py`)
 
 `MultiDimensionalAnalyzer` kết hợp ba lớp phân tích trên nến OHLC (định dạng kline Binance):
@@ -304,7 +351,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-Bộ test (81 ca, không cần mạng) bao phủ: phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
+Bộ test (104 ca, không cần mạng) bao phủ: checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
 chống trùng lặp gen và phân hoá ngách (`tests/test_genetics.py`); tự hủy (đúng ngưỡng $0.5, sau lệnh lỗ, chết đói, ngừng hoạt động sau khi chết), nhân
 bản (ngưỡng $40, trích $20, thế hệ/ID cha, đột biến trong biên, thừa kế bộ nhớ, trần quần thể), bộ lọc
 quy tắc (CAM, giảm quy mô, giới hạn đòn bẩy, ưu tiên, quy tắc hết hiệu lực, điều kiện sai định dạng),
