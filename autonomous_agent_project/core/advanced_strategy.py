@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 Kline = Sequence[Any]
 
@@ -260,3 +260,356 @@ def generate_synthetic_klines(
         rows.append([start_time_ms + i * interval_ms, round(o, 2), round(h, 2), round(low, 2), round(c, 2), 0.0])
         price = c
     return rows
+
+
+# ======================================================================
+# AdvancedMarketAnalyzer — API đa khung theo thiết kế của người dùng
+# ======================================================================
+SMC_NONE = "NONE"
+SMC_CONSOLIDATION = "CONSOLIDATION"
+BOS_UP, BOS_DOWN = "BOS_UP", "BOS_DOWN"
+CHOCH_UP, CHOCH_DOWN = "CHOCH_UP", "CHOCH_DOWN"
+BUY_FROM_BASE, SELL_FROM_BASE = "BUY_FROM_BASE", "SELL_FROM_BASE"
+WAVE_3_IMPULSE = "WAVE_3_IMPULSE"
+WAVE_5_IMPULSE = "WAVE_5_IMPULSE"
+CORRECTIVE_WAVE = "CORRECTIVE_WAVE"
+WAVE_UNKNOWN = "WAVE_UNKNOWN"
+STRONG_BUY, STRONG_SELL = "STRONG_BUY", "STRONG_SELL"
+
+_WAVE_NAMES = {WAVE_3: WAVE_3_IMPULSE, WAVE_5: WAVE_5_IMPULSE, CORRECTIVE: CORRECTIVE_WAVE, UNCLEAR: WAVE_UNKNOWN}
+
+TREND_POINTS = 2.0
+BASE_POINTS = 3.0
+ORDER_BLOCK_POINTS = 1.0
+
+
+class AdvancedMarketAnalyzer:
+    """Phân tích đa khung: SMC (BOS/CHoCH + Order Block) trên HTF, Hidden Base trên LTF, Elliott (heuristic).
+
+    Điểm hợp lưu:
+
+    * xu hướng HTF: BULLISH +2, BEARISH −2;
+    * Hidden Base phá vỡ **cùng chiều** xu hướng HTF: ±3;
+    * giá LTF đang nằm trong Order Block cùng chiều xu hướng (hồi về vùng OB): ±1;
+    * ×1.5 chỉ khi "sóng 3" (heuristic động lượng) **cùng chiều** với dấu của điểm.
+
+    Elliott ở đây KHÔNG đếm sóng thật: dùng ``MultiDimensionalAnalyzer._count_elliott_waves``
+    (so động lượng ngắn hạn với trung hạn). Công cụ minh hoạ, không phải lời khuyên đầu tư.
+    """
+
+    MIN_HTF_CANDLES = 10
+    MIN_LTF_CANDLES = 5
+    MIN_WAVE_CANDLES = 15
+
+    def __init__(
+        self,
+        symbol: str = "BTCUSDT",
+        *,
+        swing_k: int = 2,
+        base_len: int = 4,
+        breakout_ratio: float = 1.8,
+        base_max_range: float = 0.006,
+        order_block_lookback: int = 10,
+    ) -> None:
+        self.symbol = symbol.upper()
+        self.swing_k = swing_k
+        self.base_len = base_len
+        self.breakout_ratio = breakout_ratio
+        self.base_max_range = base_max_range
+        self.order_block_lookback = order_block_lookback
+        self._waves = MultiDimensionalAnalyzer(symbol, swing_k=swing_k)
+        self.last_wave_direction = NEUTRAL
+        self.reasons: list[str] = []
+
+    # ------------------------------------------------------------ Tổng hợp
+    def analyze_multi_timeframe(self, htf_klines: Sequence[Kline], ltf_klines: Sequence[Kline]) -> dict[str, Any]:
+        """HTF: xu hướng, BOS/CHoCH, Order Block. LTF: Hidden Base. Trả về điểm hợp lưu + hành động."""
+        self.reasons = []
+        htf_structure = self.detect_smc_structure(htf_klines)
+        ltf_bases = self.detect_hidden_bases(ltf_klines)
+        wave_status = self.validate_elliott_waves(htf_klines)
+        trend = htf_structure["trend"]
+
+        score = 0.0
+        if trend == BULLISH:
+            score += TREND_POINTS
+        elif trend == BEARISH:
+            score -= TREND_POINTS
+
+        if ltf_bases["signal"] == BUY_FROM_BASE and trend == BULLISH:
+            score += BASE_POINTS
+        elif ltf_bases["signal"] == SELL_FROM_BASE and trend == BEARISH:
+            score -= BASE_POINTS
+
+        ob = htf_structure.get("order_block")
+        ltf = _candles(ltf_klines)
+        if ob and ltf:
+            lo, hi = ob["zone"]
+            price = ltf[-1].close
+            if lo <= price <= hi:
+                if ob["type"] == "BULLISH_OB" and trend == BULLISH:
+                    score += ORDER_BLOCK_POINTS
+                    self.reasons.append(f"Giá {price:,.6g} hồi về Order Block tăng {lo:,.6g}–{hi:,.6g}")
+                elif ob["type"] == "BEARISH_OB" and trend == BEARISH:
+                    score -= ORDER_BLOCK_POINTS
+                    self.reasons.append(f"Giá {price:,.6g} hồi về Order Block giảm {lo:,.6g}–{hi:,.6g}")
+
+        wave_dir = self.last_wave_direction
+        if wave_status == WAVE_3_IMPULSE and score != 0 and (score > 0) == (wave_dir == BULLISH):
+            score *= WAVE_3_MULTIPLIER
+            self.reasons.append("Sóng 3 cùng chiều → ×1.5")
+
+        return {
+            "htf_trend": trend,
+            "market_structure_event": htf_structure["event"],
+            "order_block": ob,
+            "hidden_base": ltf_bases,
+            "elliott_wave": wave_status,
+            "wave_direction": wave_dir,
+            "confluence_score": round(score, 2),
+            "recommended_action": self._decide_action(score),
+            "reasons": list(self.reasons),
+        }
+
+    # ------------------------------------------------------------ HTF: SMC
+    def detect_smc_structure(self, klines: Sequence[Kline]) -> dict[str, Any]:
+        """BOS / CHoCH dựa trên đỉnh-đáy swing (fractal), kèm Order Block của nhịp phá vỡ.
+
+        * Cấu trúc trước đó (hai swing gần nhất) là HH/HL (tăng) hoặc LH/LL (giảm).
+        * Close cuối vượt đỉnh swing gần nhất → ``BOS_UP`` nếu cấu trúc trước đó không phải giảm,
+          ngược lại ``CHOCH_UP`` (đổi tính chất: giảm → tăng). Tương tự cho chiều xuống.
+        * Chưa phá: xu hướng theo HH/HL hoặc LH/LL, sự kiện ``CONSOLIDATION``.
+        * Không có swing: so close cuối với vùng giá nửa đầu dữ liệu (thay cho
+          ``max(highs[:-3])`` của bản gốc, vốn gồm cả nến đang phá nên khó xảy ra).
+        """
+        candles = _candles(klines)
+        if len(candles) < self.MIN_HTF_CANDLES:
+            self.reasons.append(f"HTF chỉ có {len(candles)} nến (< {self.MIN_HTF_CANDLES})")
+            return {"trend": NEUTRAL, "event": SMC_NONE, "order_block": None}
+        last = candles[-1].close
+        highs, lows = find_swings(candles[:-1], self.swing_k)
+        prior = NEUTRAL
+        if len(highs) >= 2 and len(lows) >= 2:
+            if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+                prior = BULLISH
+            elif highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+                prior = BEARISH
+
+        if highs and last > highs[-1]:
+            event = CHOCH_UP if prior == BEARISH else BOS_UP
+            self.reasons.append(f"HTF {event}: close {last:,.6g} vượt đỉnh swing {highs[-1]:,.6g}")
+            return {"trend": BULLISH, "event": event, "order_block": self._order_block(candles, BULLISH)}
+        if lows and last < lows[-1]:
+            event = CHOCH_DOWN if prior == BULLISH else BOS_DOWN
+            self.reasons.append(f"HTF {event}: close {last:,.6g} thủng đáy swing {lows[-1]:,.6g}")
+            return {"trend": BEARISH, "event": event, "order_block": self._order_block(candles, BEARISH)}
+        if prior != NEUTRAL:
+            self.reasons.append(f"HTF {'HH/HL' if prior == BULLISH else 'LH/LL'}, chưa phá cấu trúc")
+            return {"trend": prior, "event": SMC_CONSOLIDATION, "order_block": self._order_block(candles, prior)}
+
+        if not highs and not lows:
+            first_half = candles[: len(candles) // 2]
+            if last > max(c.high for c in first_half):
+                self.reasons.append("HTF không có swing, giá vượt vùng cao nửa đầu dữ liệu → BOS_UP")
+                return {"trend": BULLISH, "event": BOS_UP, "order_block": self._order_block(candles, BULLISH)}
+            if last < min(c.low for c in first_half):
+                self.reasons.append("HTF không có swing, giá thủng vùng thấp nửa đầu dữ liệu → BOS_DOWN")
+                return {"trend": BEARISH, "event": BOS_DOWN, "order_block": self._order_block(candles, BEARISH)}
+        self.reasons.append("HTF đi ngang, chưa rõ cấu trúc")
+        return {"trend": NEUTRAL, "event": SMC_CONSOLIDATION, "order_block": None}
+
+    def _order_block(self, candles: Sequence[Candle], trend: str) -> dict[str, Any] | None:
+        """Order Block đơn giản: nến ngược màu cuối cùng trước nhịp đẩy (trong ``order_block_lookback`` nến).
+
+        Xu hướng tăng → nến giảm cuối cùng (vùng cầu); xu hướng giảm → nến tăng cuối cùng (vùng cung).
+        """
+        window = list(candles[-self.order_block_lookback - 1 : -1])
+        for c in reversed(window):
+            if trend == BULLISH and c.close < c.open:
+                return {"type": "BULLISH_OB", "zone": (c.low, c.high)}
+            if trend == BEARISH and c.close > c.open:
+                return {"type": "BEARISH_OB", "zone": (c.low, c.high)}
+        return None
+
+    # ------------------------------------------------------- LTF: Hidden Base
+    def detect_hidden_bases(self, klines: Sequence[Kline]) -> dict[str, Any]:
+        """Nền giá chặt (``base_len`` nến) rồi nến cuối bứt phá mạnh ra khỏi nền.
+
+        Khác bản gốc: biên độ trung bình chỉ tính trên các nến **nền** (không gồm nến bứt phá),
+        nến cuối phải đóng cửa **ra ngoài** vùng nền, và nền phải đủ chặt (≤ ``base_max_range``).
+        """
+        candles = _candles(klines)
+        if len(candles) < max(self.MIN_LTF_CANDLES, self.base_len + 1):
+            return {"signal": HOLD, "zone": (0, 0)}
+        base = candles[-1 - self.base_len : -1]
+        last = candles[-1]
+        lo, hi = min(c.low for c in base), max(c.high for c in base)
+        avg_range = sum(c.range for c in base) / len(base)
+        tight = lo > 0 and (hi - lo) / lo <= self.base_max_range
+        strong = last.range > 0 and (avg_range == 0 or last.range > avg_range * self.breakout_ratio)
+        if tight and strong:
+            zone = (round(lo, 8), round(hi, 8))
+            if last.close > hi and last.close > last.open:
+                self.reasons.append(f"LTF: bứt phá tăng khỏi Hidden Base {lo:,.6g}–{hi:,.6g}")
+                return {"signal": BUY_FROM_BASE, "zone": zone}
+            if last.close < lo and last.close < last.open:
+                self.reasons.append(f"LTF: bứt phá giảm khỏi Hidden Base {lo:,.6g}–{hi:,.6g}")
+                return {"signal": SELL_FROM_BASE, "zone": zone}
+        return {"signal": HOLD, "zone": (0, 0)}
+
+    # ---------------------------------------------------- Elliott (heuristic)
+    def validate_elliott_waves(self, klines: Sequence[Kline]) -> str:
+        """Pha sóng theo heuristic động lượng (không phải đếm sóng Elliott thật).
+
+        Trả về ``WAVE_3_IMPULSE`` / ``WAVE_5_IMPULSE`` / ``CORRECTIVE_WAVE`` / ``WAVE_UNKNOWN``;
+        chiều của nhịp lưu ở ``last_wave_direction``.
+        """
+        if not klines or len(klines) < self.MIN_WAVE_CANDLES:
+            self.last_wave_direction = NEUTRAL
+            return WAVE_UNKNOWN
+        self._waves.reasons = []
+        status, direction = self._waves._count_elliott_waves(klines)
+        self.reasons.extend(self._waves.reasons)
+        self.last_wave_direction = direction
+        return _WAVE_NAMES[status]
+
+    def _decide_action(self, score: float) -> str:
+        if score >= 3.0:
+            return STRONG_BUY
+        if score > 0:
+            return "BUY"
+        if score <= -3.0:
+            return STRONG_SELL
+        if score < 0:
+            return "SELL"
+        return HOLD
+
+
+class CandleBuilder:
+    """Gom chuỗi giá tick thành nến OHLC (``ticks_per_candle`` tick mỗi nến) theo định dạng kline.
+
+    Thị trường giả lập chỉ sinh giá đóng cửa mỗi tick, nên open/high/low/close của một nến được
+    lấy từ các tick trong nến đó. Nến đang hình thành được nối vào cuối danh sách.
+    """
+
+    def __init__(self, ticks_per_candle: int, max_candles: int = 60) -> None:
+        if ticks_per_candle < 1:
+            raise ValueError("ticks_per_candle phải ≥ 1")
+        self.ticks_per_candle = ticks_per_candle
+        self.max_candles = max_candles
+        self.candles: list[list[float]] = []
+        self.current: list[float] | None = None
+        self.count = 0
+
+    def add(self, tick: int, price: float) -> None:
+        if self.current is None:
+            self.current = [float(tick), price, price, price, price, 0.0]
+            self.count = 0
+        c = self.current
+        c[2] = max(c[2], price)
+        c[3] = min(c[3], price)
+        c[4] = price
+        self.count += 1
+        if self.count >= self.ticks_per_candle:
+            self.candles.append(c)
+            del self.candles[: -self.max_candles]
+            self.current = None
+
+    def klines(self) -> list[list[float]]:
+        rows = [list(c) for c in self.candles]
+        if self.current is not None:
+            rows.append(list(self.current))
+        return rows[-self.max_candles :]
+
+    def to_state(self) -> dict[str, Any]:
+        return {"ticks_per_candle": self.ticks_per_candle, "candles": [list(c) for c in self.candles],
+                "current": list(self.current) if self.current else None, "count": self.count}
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        self.candles = [[float(x) for x in c] for c in state.get("candles", [])][-self.max_candles :]
+        cur = state.get("current")
+        self.current = [float(x) for x in cur] if cur else None
+        self.count = int(state.get("count", 0))
+
+
+KlineFetcher = Callable[[str, int], "list[list[Any]] | None"]  # (interval, limit) → klines
+
+
+class ConfluenceFeed:
+    """Cấp điểm hợp lưu đa khung cho mỗi tick của mô phỏng.
+
+    * Mặc định dựng nến từ chuỗi giá tick: HTF = ``htf_ticks`` tick/nến, LTF = ``ltf_ticks`` tick/nến.
+    * Nếu có ``fetch`` (chế độ giá thật), lấy nến Binance ``htf_interval``/``ltf_interval`` và làm mới
+      sau mỗi ``refresh_htf``/``refresh_ltf`` tick; lấy lỗi thì dùng nến gom từ tick.
+    """
+
+    def __init__(
+        self,
+        analyzer: AdvancedMarketAnalyzer | None = None,
+        *,
+        htf_ticks: int = 8,
+        ltf_ticks: int = 2,
+        htf_max: int = 60,
+        ltf_max: int = 30,
+        fetch: KlineFetcher | None = None,
+        htf_interval: str = "1h",
+        ltf_interval: str = "1m",
+        refresh_htf: int = 30,
+        refresh_ltf: int = 5,
+    ) -> None:
+        self.analyzer = analyzer or AdvancedMarketAnalyzer()
+        self.htf = CandleBuilder(htf_ticks, htf_max)
+        self.ltf = CandleBuilder(ltf_ticks, ltf_max)
+        self.fetch = fetch
+        self.htf_interval, self.ltf_interval = htf_interval, ltf_interval
+        self.refresh_htf, self.refresh_ltf = refresh_htf, refresh_ltf
+        self._remote: dict[str, tuple[int, list[list[Any]]]] = {}
+        self.last: dict[str, Any] | None = None
+        self.source = "nến gom từ tick"
+
+    def _remote_klines(self, key: str, tick: int, interval: str, limit: int, every: int) -> list[list[Any]] | None:
+        cached = self._remote.get(key)
+        if cached is not None and tick - cached[0] < every:
+            return cached[1]
+        rows = self.fetch(interval, limit) if self.fetch else None
+        if rows:
+            self._remote[key] = (tick, rows)
+            return rows
+        self._remote.pop(key, None)
+        return None
+
+    def update(self, tick: int, price: float) -> dict[str, Any]:
+        self.htf.add(tick, price)
+        self.ltf.add(tick, price)
+        htf = ltf = None
+        if self.fetch is not None:
+            htf = self._remote_klines("htf", tick, self.htf_interval, self.htf.max_candles, self.refresh_htf)
+            ltf = self._remote_klines("ltf", tick, self.ltf_interval, self.ltf.max_candles, self.refresh_ltf)
+        remote = htf is not None and ltf is not None
+        self.source = f"Binance {self.htf_interval}/{self.ltf_interval}" if remote else "nến gom từ tick"
+        if not remote:
+            htf, ltf = self.htf.klines(), self.ltf.klines()
+        result = self.analyzer.analyze_multi_timeframe(htf, ltf)
+        result["source"] = self.source
+        result["tick"] = tick
+        self.last = result
+        return result
+
+    def to_state(self) -> dict[str, Any]:
+        return {"htf": self.htf.to_state(), "ltf": self.ltf.to_state(), "last": self.last}
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        self.htf.load_state(state.get("htf", {}))
+        self.ltf.load_state(state.get("ltf", {}))
+        self.last = state.get("last")
+
+
+def describe_analysis(result: dict[str, Any] | None) -> str:
+    """Một dòng tóm tắt kết quả phân tích để in log."""
+    if not result:
+        return "đa khung: chưa có dữ liệu"
+    base = result["hidden_base"]["signal"]
+    return (
+        f"đa khung {result['htf_trend']}/{result['market_structure_event']}, base {base}, "
+        f"{result['elliott_wave']}, điểm {result['confluence_score']:+.1f} → {result['recommended_action']}"
+    )
