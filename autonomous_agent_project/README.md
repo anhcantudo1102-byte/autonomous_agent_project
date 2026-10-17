@@ -19,7 +19,7 @@ autonomous_agent_project/
 │   ├── strategy.py      # Thị trường, chiến lược, interface thực thi, bộ lọc quy tắc, toán tử gen
 │   ├── memory.py        # Reflexion: Post-Mortem, đúc kết quy tắc, ghi JSON atomic
 │   ├── price_feed.py    # Lấy giá/nến thật từ API công khai Binance (cần requests)
-│   ├── advanced_strategy.py # MultiDimensionalAnalyzer: SMC + Elliott (heuristic) + Hidden Base
+│   ├── advanced_strategy.py # MultiDimensionalAnalyzer, AdvancedMarketAnalyzer (BOS/CHoCH/OB), ConfluenceFeed
 │   ├── checkpoint.py    # Lưu/khôi phục checkpoint quần thể (atomic, có schema_version)
 │   └── dashboard.py     # Dashboard terminal bằng rich (tuỳ chọn): quần thể, sự kiện, di truyền
 ├── advanced_demo.py     # Demo phân tích đa khung thời gian (nến giả lập hoặc --live)
@@ -99,6 +99,9 @@ python main.py --memory /tmp/thi_nghiem.json --reset-memory --tick 0
 | `--resume` | tắt | Khôi phục quần thể từ checkpoint rồi chạy tiếp `--steps` tick |
 | `--dashboard` | tắt | Dashboard trực quan trên terminal (cần `rich`; không có thì dùng log thường) |
 | `--live-dashboard` | tắt | Viết tắt: `--live-price --dashboard --steps 30 --tick 2` (cờ ghi rõ được ưu tiên) |
+| `--advanced-analysis` | tắt | Bật bộ lọc hợp lưu đa khung (SMC/Order Block/Hidden Base/Elliott) và gen tin tưởng `confluence_weight` |
+| `--htf-ticks` / `--ltf-ticks` | 8 / 2 | Số tick gom thành một nến HTF / LTF |
+| `--htf-interval` / `--ltf-interval` | 1h / 1m | Khung nến Binance khi dùng cùng `--live-price` |
 | `--no-fsync` | tắt | Bỏ `fsync` khi ghi để chạy nhanh hơn (vẫn atomic nhờ `os.replace`) |
 | `-v` / `-q` | | Chi tiết hơn / chỉ cảnh báo |
 
@@ -394,8 +397,84 @@ Output mẫu với `--live`:
 ```
 
 Nến thật lấy qua `core.price_feed.fetch_klines` (`/api/v3/klines`). Khi bị chặn HTTP 451, hàm thử tiếp
-`data-api.binance.vision`. Bộ phân tích này **chưa nối vào vòng mô phỏng `main.py`**, vì thị trường mô
-phỏng chỉ sinh giá đóng cửa và không có nến OHLC.
+`data-api.binance.vision`.
+
+### `AdvancedMarketAnalyzer` và cờ `--advanced-analysis`
+
+`AdvancedMarketAnalyzer` giữ đúng API công khai của bản thiết kế:
+* `analyze_multi_timeframe(htf, ltf)` trả về `htf_trend`, `market_structure_event`, `order_block`, `hidden_base`,
+  `elliott_wave`, `wave_direction`, `confluence_score`, `recommended_action` và `reasons`.
+* `detect_smc_structure` trả về `{"trend", "event", "order_block"}`.
+* `detect_hidden_bases` trả về `{"signal", "zone"}`.
+* Ngoài ra còn `validate_elliott_waves` và `_decide_action`.
+
+Lớp này tái sử dụng swing fractal và heuristic sóng của `MultiDimensionalAnalyzer`, đồng thời sửa các điểm yếu của bản gốc:
+
+| Bản gốc | Bản hiện tại |
+| --- | --- |
+| Elliott luôn trả `WAVE_3_IMPULSE` | Heuristic động lượng: `WAVE_3_IMPULSE` / `WAVE_5_IMPULSE` / `CORRECTIVE_WAVE` / `WAVE_UNKNOWN` (dưới 15 nến) |
+| ×1.5 nhân cả điểm âm lẫn dương, bất kể chiều sóng | ×1.5 chỉ khi sóng 3 **cùng chiều** với dấu của điểm |
+| `avg_range` của Hidden Base tính cả nến bứt phá | Chỉ tính các nến nền. Nền phải chặt (≤ 0.6%), nến cuối phải đóng **ngoài** nền, vùng `zone` = (đáy nền, đỉnh nền) |
+| CHoCH chỉ được nhắc tới | Có `CHOCH_UP`/`CHOCH_DOWN` khi phá ngược cấu trúc trước đó (LH/LL → phá đỉnh, HH/HL → thủng đáy); cùng chiều → `BOS_UP`/`BOS_DOWN`; chưa phá → `CONSOLIDATION` |
+| Order Block chỉ được nhắc tới | OB đơn giản: nến ngược màu cuối cùng trong 10 nến trước nến hiện tại |
+
+Cách tính điểm hợp lưu:
+* Xu hướng HTF: ±2.
+* Base phá vỡ **cùng chiều** xu hướng HTF: ±3.
+* Giá LTF nằm trong Order Block cùng chiều: ±1.
+* Sau đó nhân ×1.5 nếu sóng 3 cùng chiều.
+
+Hành động khuyến nghị: điểm ≥ 3 → `STRONG_BUY`, > 0 → `BUY`, ≤ −3 → `STRONG_SELL`, < 0 → `SELL`, còn lại `HOLD`.
+
+```bash
+python main.py --advanced-analysis --seed 7 --tick 0                 # nến gom từ tick: HTF 8 tick/nến, LTF 2 tick/nến
+python main.py --advanced-analysis --htf-ticks 12 --ltf-ticks 3 --dashboard
+python main.py --advanced-analysis --live-price --htf-interval 1h --ltf-interval 1m   # nến Binance, lỗi → nến từ tick
+```
+
+Cờ này **mặc định tắt**. Khi tắt, kết quả với cùng seed không đổi: đã đối chiếu từng dòng báo cáo và quy tắc
+trong bộ nhớ của seed 1, 7, 21 qua 400 tick.
+
+Khi bật cờ:
+* **Nguồn nến.** `ConfluenceFeed` dựng nến OHLC HTF/LTF từ chuỗi giá tick qua `CandleBuilder`. Với `--live-price`,
+  nó lấy nến Binance qua `fetch_klines`, làm mới HTF mỗi 30 tick và LTF mỗi 5 tick. Lấy nến lỗi thì quay về nến
+  gom từ tick. HTF cần ít nhất 10 nến nên các tick đầu cho điểm 0.
+* **Gen mới.** Mỗi agent có gen `confluence_weight` ∈ [0, 1], là mức tin tín hiệu đa khung. GA tự học gen này
+  qua đột biến cộng nhiễu và lai ghép. Độ mạnh = gen × |điểm| / 5.
+* **Tác động lên lệnh động lượng:**
+  * Lệnh cùng chiều với điểm: tăng tỷ trọng tới ×(1 + 0.5 × độ mạnh), tối đa 90%.
+  * Lệnh ngược chiều: độ mạnh ≥ 0.5 thì bị **phủ quyết**; yếu hơn thì giảm tỷ trọng.
+  * Động lượng yếu nhưng độ mạnh ≥ 0.6: agent tự vào lệnh theo chiều điểm.
+  * Biến động vượt ngưỡng chịu đựng của gen thì vẫn đứng ngoài.
+* **Bộ nhớ chung.** Lệnh do đa khung mở vẫn phải qua bộ lọc quy tắc CẤM / GIẢM_QUY_MÔ / GIỚI_HẠN_ĐÒN_BẨY.
+* **Hiển thị.** Dòng `🧭` sau mỗi dòng `📊` tóm tắt xu hướng/cấu trúc, base, sóng, điểm và khuyến nghị. Báo cáo cuối và
+  dashboard cũng hiển thị các thông tin này, cùng cột "Tin đa khung" của từng agent.
+* **Checkpoint.** Checkpoint lưu thêm khoá `advanced` (nến HTF/LTF và kết quả phân tích gần nhất), nên resume vẫn
+  cho kết quả y hệt chạy liền. Resume một checkpoint cũ (không có gen) kèm cờ này thì agent được gán gen ngẫu nhiên.
+
+So sánh nhanh, 500 tick, 5 agent, bộ nhớ mới mỗi lần chạy. Cột "đối chứng" bật cờ nhưng bỏ tác động của điểm lên
+lệnh. Cột này chỉ đo việc bật cờ làm lệch dòng ngẫu nhiên (rút thêm gen lúc khởi sinh).
+
+| Seed | Mặc định: vốn (sống/chết) | Đối chứng: vốn (sống/chết) | `--advanced-analysis`: vốn (sống/chết) |
+| --- | --- | --- | --- |
+| 1 | $53.92 (4/1) | $61.26 (5/0) | $57.65 (5/0) |
+| 2 | $33.28 (4/1) | $32.21 (5/0) | $33.20 (5/0) |
+| 3 | $339.67 (12/1) | $249.18 (11/1) | $236.80 (11/1) |
+| 7 | $71.18 (9/1) | $74.03 (5/0) | $73.36 (5/0) |
+| 21 | $77.10 (5/0) | $121.64 (7/0) | $123.78 (7/0) |
+| 42 | $148.18 (6/2) | $137.49 (5/1) | $135.96 (6/1) |
+| 99 | $57.10 (5/0) | $82.23 (5/0) | $84.05 (5/0) |
+| 123 | $501.74 (21/0) | $391.71 (14/1) | $345.17 (14/1) |
+| **Tổng** | **$1,282.17 (66/6)** | **$1,149.75 (57/3)** | **$1,089.97 (58/3)** |
+
+Kết luận trung thực: **bật cờ không giúp hệ sinh thái tốt hơn trên thị trường giả lập.**
+* So với mặc định, tổng vốn thấp hơn khoảng 15% và số agent chết ít hơn (3 so với 6). Tuy vậy, phần lớn chênh lệch
+  này đến từ việc dòng ngẫu nhiên bị lệch: cột đối chứng gần như trùng cột `--advanced-analysis`.
+* Tách riêng tác động của điểm hợp lưu thì tổng vốn thấp hơn đối chứng khoảng 5%: tốt hơn ở 3/8 seed, kém hơn ở 5/8
+  seed (kém nhiều nhất ở seed 123).
+* Điều này hợp lý: giá giả lập là bước ngẫu nhiên đổi chế độ, nên cấu trúc SMC trên nến gom từ tick không mang
+  nhiều thông tin dự báo.
+* Gen tin tưởng trung bình cuối kỳ dao động 0.29–0.67 và chưa hội tụ trong 500 tick.
 
 ## Chạy test
 
@@ -406,7 +485,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-Bộ test (136 ca, không cần mạng, không cần TTY) bao phủ: giá khởi điểm dự phòng theo cặp và tính độc lập với thang giá (`tests/test_fallback_price.py`); `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
+Bộ test (175 ca, không cần mạng, không cần TTY) bao phủ: `AdvancedMarketAnalyzer` (3 test gốc của người dùng, BOS/CHoCH, Order Block, Hidden Base, sóng, hệ số ×1.5 theo chiều), `CandleBuilder`, `ConfluenceFeed` với nến Binance được mock, gen `confluence_weight` (phủ quyết, tăng/giảm tỷ trọng, quy tắc CẤM vẫn chặn) và `--advanced-analysis` trong `main.py` (mặc định tắt, resume tất định, dashboard) (`tests/test_advanced_strategy.py`, `tests/test_strategy.py`, `tests/test_advanced_integration.py`); giá khởi điểm dự phòng theo cặp và tính độc lập với thang giá (`tests/test_fallback_price.py`); `run_simulation_with_dashboard` và `--live-dashboard` với giá Binance được mock (`tests/test_live_dashboard.py`); dashboard (render ra chuỗi, best_agent None, bảng quần thể, sự kiện sinh/chết/CẤM, dự phòng khi thiếu rich hoặc không phải TTY, Ctrl+C) (`tests/test_dashboard.py`); checkpoint (ghi atomic, schema, tệp hỏng, bản sao best_agent, resume cho kết quả y hệt chạy liền, Ctrl+C) (`tests/test_checkpoint.py`); phân tích đa khung SMC/Price Action/Elliott heuristic, `fetch_klines` và demo (`tests/test_advanced_strategy.py`); chế độ giá thật và cơ chế dự phòng về giá giả lập (`tests/test_live_market.py`, `tests/test_price_feed.py`); Fitness (công thức, Max DD, cổng nhân bản), lai ghép, đột biến thích ứng,
 chống trùng lặp gen và phân hoá ngách (`tests/test_genetics.py`); tự hủy (đúng ngưỡng $0.5, sau lệnh lỗ, chết đói, ngừng hoạt động sau khi chết), nhân
 bản (ngưỡng $40, trích $20, thế hệ/ID cha, đột biến trong biên, thừa kế bộ nhớ, trần quần thể), bộ lọc
 quy tắc (CAM, giảm quy mô, giới hạn đòn bẩy, ưu tiên, quy tắc hết hiệu lực, điều kiện sai định dạng),
