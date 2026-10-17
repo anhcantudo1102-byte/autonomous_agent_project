@@ -694,11 +694,12 @@ class GeneticController:
 def _diff_params(a: StrategyParams, b: StrategyParams) -> str:
     da, db = a.to_dict(), b.to_dict()
     parts = []
-    for k in da:
-        if da[k] != db[k]:
-            if isinstance(da[k], bool):
-                parts.append(f"{k}: {da[k]}→{db[k]}")
+    for k in dict.fromkeys([*da, *db]):
+        va, vb = da.get(k), db.get(k)
+        if va != vb:
+            if isinstance(va, (int, float)) and isinstance(vb, (int, float)) and not isinstance(va, bool):
+                parts.append(f"{k}: {va:.4g}→{vb:.4g}")
             else:
-                parts.append(f"{k}: {da[k]:.4g}→{db[k]:.4g}")
+                parts.append(f"{k}: {va}→{vb}")
     return ", ".join(parts) or "không đổi"
 

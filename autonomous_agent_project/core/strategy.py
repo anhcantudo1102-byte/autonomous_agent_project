@@ -52,6 +52,8 @@ class MarketSnapshot:
     momentum: float
     volatility: float
     regime: str
+    # Điểm hợp lưu đa khung (AdvancedMarketAnalyzer); None khi không bật --advanced-analysis.
+    confluence: float | None = None
 
     def features(self) -> dict[str, float]:
         """Các đặc trưng agent được phép quan sát (chế độ thị trường bị ẩn)."""
@@ -174,6 +176,13 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "leverage": (1.0, 5.0),
     "vol_tolerance": (0.005, 0.08),
 }
+# Gen tuỳ chọn: mức tin tưởng vào điểm hợp lưu đa khung (0 = bỏ qua, 1 = tin hoàn toàn).
+# None = tính năng tắt; khi đó gen không tham gia đột biến/lai ghép/khoảng cách, nên không tốn
+# thêm số ngẫu nhiên và kết quả theo seed giữ nguyên như trước khi có gen này.
+CONFLUENCE_WEIGHT_BOUNDS = (0.0, 1.0)
+CONFLUENCE_SCALE = 5.0        # |điểm| ≥ 5 coi là tín hiệu đầy đủ
+CONFLUENCE_VETO = 0.5         # độ mạnh (tin tưởng × |điểm chuẩn hoá|) để phủ quyết lệnh ngược chiều
+CONFLUENCE_ENTRY = 0.6        # độ mạnh để tự vào lệnh khi động lượng chưa đủ
 
 
 @dataclass(frozen=True)
@@ -185,6 +194,7 @@ class StrategyParams:
     leverage: float = 2.0
     vol_tolerance: float = 0.03
     contrarian: bool = False
+    confluence_weight: float | None = None
 
     @classmethod
     def random(cls, rng: random.Random) -> "StrategyParams":
@@ -203,6 +213,10 @@ class StrategyParams:
             v = getattr(self, name) * rng.gauss(1.0, rate)
             values[name] = round(min(hi, max(lo, v)), 6)
         values["contrarian"] = (not self.contrarian) if rng.random() < flip_prob else self.contrarian
+        if self.confluence_weight is not None:
+            lo, hi = CONFLUENCE_WEIGHT_BOUNDS
+            # Cộng nhiễu (không nhân) để gen có thể rời khỏi 0.
+            values["confluence_weight"] = round(min(hi, max(lo, self.confluence_weight + rng.gauss(0.0, rate))), 6)
         return StrategyParams(**values)
 
     @classmethod
@@ -222,12 +236,19 @@ class StrategyParams:
             name: getattr(rng.choices(parents, weights=weights, k=1)[0], name)
             for name in (*PARAM_BOUNDS, "contrarian")
         }
+        if any(p.confluence_weight is not None for p in parents):
+            donor = rng.choices(parents, weights=weights, k=1)[0]
+            fallback = next(p.confluence_weight for p in parents if p.confluence_weight is not None)
+            values["confluence_weight"] = donor.confluence_weight if donor.confluence_weight is not None else fallback
         return cls(**values)
 
     def genome(self) -> tuple[float, ...]:
         """Bộ gen chuẩn hoá về [0, 1] để đo khoảng cách giữa các chiến lược."""
         vec = [(getattr(self, n) - lo) / (hi - lo) for n, (lo, hi) in PARAM_BOUNDS.items()]
         vec.append(1.0 if self.contrarian else 0.0)
+        if self.confluence_weight is not None:
+            lo, hi = CONFLUENCE_WEIGHT_BOUNDS
+            vec.append((self.confluence_weight - lo) / (hi - lo))
         return tuple(min(1.0, max(0.0, v)) for v in vec)
 
     def distance(self, other: "StrategyParams") -> float:
@@ -236,7 +257,10 @@ class StrategyParams:
         return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)) / len(a))
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        if data["confluence_weight"] is None:
+            del data["confluence_weight"]
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StrategyParams":
@@ -314,6 +338,7 @@ def diversify(
     swapped = set(rng.sample(names, k=max(1, len(names) // 2)))
     values = {n: getattr(stranger if n in swapped else params, n) for n in names}
     values["contrarian"] = stranger.contrarian if rng.random() < 0.5 else params.contrarian
+    values["confluence_weight"] = params.confluence_weight
     params = StrategyParams(**values)
     return DiversityResult(params, nearest_distance(params, population), attempts, immigrant=True)
 
@@ -505,6 +530,44 @@ class TradingStrategy:
         self.rule_filter = rule_filter or RuleFilter()
 
     def propose(self, snapshot: MarketSnapshot) -> Order:
+        order = self._momentum_order(snapshot)
+        if self.params.confluence_weight is None or snapshot.confluence is None:
+            return order
+        return self._apply_confluence(order, snapshot)
+
+    def _apply_confluence(self, order: Order, snapshot: MarketSnapshot) -> Order:
+        """Dùng điểm hợp lưu đa khung làm bộ lọc/thiên hướng, theo mức tin tưởng ``confluence_weight``.
+
+        Độ mạnh = tin tưởng × |điểm| / ``CONFLUENCE_SCALE`` (kẹp trong [0, 1]):
+
+        * lệnh động lượng **cùng chiều** điểm: tăng tỷ trọng tới ×(1 + 0.5 × độ mạnh), tối đa 90%;
+        * lệnh **ngược chiều**: độ mạnh ≥ ``CONFLUENCE_VETO`` → phủ quyết (HOLD), yếu hơn → giảm tỷ trọng;
+        * động lượng chưa đủ mà độ mạnh ≥ ``CONFLUENCE_ENTRY`` → tự vào lệnh theo chiều điểm.
+
+        Biến động vượt ngưỡng chịu đựng của gen vẫn luôn đứng ngoài. Lệnh sau đó vẫn qua bộ lọc
+        quy tắc (CẤM/giảm quy mô/giới hạn đòn bẩy) của bộ nhớ chung.
+        """
+        p = self.params
+        score = float(snapshot.confluence or 0.0)
+        strength = min(1.0, max(0.0, p.confluence_weight or 0.0) * abs(score) / CONFLUENCE_SCALE)
+        if strength == 0 or snapshot.volatility > p.vol_tolerance:
+            return order
+        want = Direction.LONG if score > 0 else Direction.SHORT
+        lo_f, hi_f = PARAM_BOUNDS["position_fraction"]
+        if order.is_trade:
+            if order.direction == want:
+                fraction = min(hi_f, order.fraction * (1 + 0.5 * strength))
+                return replace(order, fraction=fraction, reason=f"{order.reason}, đa khung ủng hộ ({score:+.1f})")
+            if strength >= CONFLUENCE_VETO:
+                return Order(Direction.HOLD, 0.0, 1.0, f"đa khung phủ quyết (điểm {score:+.1f})")
+            fraction = max(lo_f, order.fraction * (1 - strength))
+            return replace(order, fraction=fraction, reason=f"{order.reason}, đa khung ngược chiều ({score:+.1f})")
+        if strength >= CONFLUENCE_ENTRY:
+            return Order(want, max(lo_f, p.position_fraction * strength), p.leverage,
+                         f"vào lệnh theo đa khung (điểm {score:+.1f})")
+        return order
+
+    def _momentum_order(self, snapshot: MarketSnapshot) -> Order:
         p = self.params
         if abs(snapshot.momentum) < p.momentum_threshold:
             return Order(Direction.HOLD, 0.0, 1.0, "tín hiệu động lượng quá yếu")
