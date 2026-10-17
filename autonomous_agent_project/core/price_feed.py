@@ -83,6 +83,39 @@ def get_latest_price(
     return price
 
 
+def fetch_klines(
+    symbol: str,
+    interval: str = "4h",
+    limit: int = 100,
+    *,
+    timeout: float = 5.0,
+    endpoints: Sequence[str] = BINANCE_ENDPOINTS,
+    report: Callable[[str], object] | None = None,
+) -> list[list] | None:
+    """Lấy nến từ ``/api/v3/klines`` (thử lần lượt các endpoint); ``None`` nếu mọi endpoint lỗi.
+
+    Mỗi nến có dạng ``[open_time, open, high, low, close, volume, ...]`` (giá là chuỗi số).
+    """
+    report = report or print
+    if requests is None:
+        report("Lỗi: chưa cài thư viện requests — chạy `pip install requests`.")
+        return None
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    for base in endpoints:
+        try:
+            response = requests.get(f"{base}/api/v3/klines", params=params, timeout=timeout)
+            data = response.json()
+        except (requests.RequestException, ValueError) as e:
+            report(f"Lỗi khi kết nối API Binance ({base}): {e}")
+            continue
+        if response.status_code != 200 or not isinstance(data, list) or not data:
+            msg = data.get("msg", data) if isinstance(data, dict) else "không có dữ liệu nến"
+            report(f"Lỗi từ API Binance klines ({base}, HTTP {response.status_code}): {msg}")
+            continue
+        return data
+    return None
+
+
 class LiveMarketFeed:
     """Thị trường dựa trên giá thật: mỗi ``step()`` lấy một giá mới từ Binance.
 
