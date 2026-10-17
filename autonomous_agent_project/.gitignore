@@ -4,6 +4,9 @@ data/*.lock
 data/.memory_*.tmp
 !data/.gitkeep
 
+# Cache nến lịch sử tải về cho --backtest
+data/history/
+
 # Checkpoint quần thể sinh ra khi chạy main.py / evolution_demo.py
 checkpoints/
 

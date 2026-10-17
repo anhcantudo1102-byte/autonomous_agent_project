@@ -9,11 +9,14 @@ Ví dụ:
     python main.py --dashboard --tick 0.1                      # dashboard trực quan (cần rich)
     python main.py --live-dashboard                            # giá thật + dashboard, 30 bước, tick 2 giây
     python main.py --advanced-analysis --seed 7 --tick 0       # thêm bộ lọc hợp lưu đa khung (SMC/Base/Elliott)
+    python main.py --backtest --symbol BTCUSDT --interval 1h --start 2024-01-01 --end 2024-06-30 --seed 7
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import logging
 import random
 import signal
@@ -21,12 +24,24 @@ import statistics
 import sys
 import time
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from core import checkpoint as ckpt
 from core.advanced_strategy import ConfluenceFeed, describe_analysis
 from core.agent import FITNESS_THRESHOLD, INITIAL_CAPITAL, Agent, GeneticConfig, GeneticController
+from core.history import (
+    HistoricalMarket,
+    HistoryUnavailable,
+    buy_and_hold,
+    interval_ms,
+    load_history,
+    max_drawdown,
+    ms_to_text,
+    parse_date,
+    read_history_csv,
+)
 from core.memory import MemoryBank
 from core.price_feed import (
     REALISTIC_FALLBACK_PRICES,
@@ -45,6 +60,9 @@ LIVE_DASHBOARD_DEFAULTS = {"live_price": True, "dashboard": True, "steps": 30, "
 CHECKPOINT_FIELDS = ("tick", "next_id", "rng", "market", "agents", "graveyard")
 DEFAULT_TICK_SIMULATED = 0.05
 DEFAULT_TICK_LIVE = 2.0
+DEFAULT_STEPS = 500
+DEFAULT_BACKTEST_DAYS = 180
+DEFAULT_HISTORY_DIR = PROJECT_DIR / "data" / "history"
 
 log = logging.getLogger("he_sinh_thai")
 
@@ -55,13 +73,22 @@ class Ecosystem:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.rng = random.Random(args.seed)
-        self.memory = MemoryBank(args.memory, durable=not args.no_fsync)
+        # Backtest ghi bộ nhớ sau mỗi Post-Mortem hàng nghìn lần: dùng JSON gọn, bỏ fsync để không nghẽn ở I/O.
+        self.memory = MemoryBank(args.memory, durable=not (args.no_fsync or args.backtest), compact=args.backtest)
         if args.reset_memory:
             self.memory.reset()
         market_rng = random.Random(self.rng.random())
-        self.market: MarketSimulator | LiveMarketFeed
+        self.market: MarketSimulator | LiveMarketFeed | HistoricalMarket
         self.price_source = "giả lập"
-        if args.live_price:
+        self.equity_curve: list[tuple[int, float, float]] = []  # (tick, giá, tổng tài sản hệ sinh thái) khi backtest
+        self.extinct_at: int | None = None
+        if args.backtest:
+            candles, source = self._load_candles(args)
+            self.market = HistoricalMarket(candles, symbol=args.symbol, interval=args.interval, rng=market_rng)
+            first, last = self.market.time_range()
+            self.price_source = (f"lịch sử {self.market.symbol} {args.interval} {first} → {last} UTC, "
+                                 f"{self.market.total_ticks} nến ({source})")
+        elif args.live_price:
             try:
                 self.market = LiveMarketFeed(args.symbol, rng=market_rng)
             except LivePriceUnavailable as e:
@@ -123,6 +150,14 @@ class Ecosystem:
         self._next_id += 1
         return agent_id
 
+    @staticmethod
+    def _load_candles(args: argparse.Namespace) -> tuple[list[list], str]:
+        if args.history_file is not None:
+            return read_history_csv(args.history_file), f"tệp {args.history_file}"
+        log.info("📥 Lấy nến %s %s từ %s đến %s (cache: %s)", args.symbol.upper(), args.interval,
+                 args.start, args.end, args.history_dir)
+        return load_history(args.symbol, args.interval, args.start, args.end, cache_dir=args.history_dir)
+
     # ------------------------------------------------------------ Checkpoint
     def _update_best(self) -> None:
         """Giữ BẢN SAO trạng thái agent có Fitness cao nhất từng ghi nhận (không phải tham chiếu)."""
@@ -145,15 +180,23 @@ class Ecosystem:
     def _market_state(self) -> dict[str, Any]:
         m = self.market
         state: dict[str, Any] = {
-            "type": "live" if isinstance(m, LiveMarketFeed) else "simulator",
+            "type": self._market_kind(m),
             "tick": m.tick,
             "regime": m.regime,
             "prices": list(m.prices),
             "returns": list(m.returns),
         }
-        if isinstance(m, LiveMarketFeed):
+        if isinstance(m, (LiveMarketFeed, HistoricalMarket)):
             state["symbol"] = m.symbol
+        if isinstance(m, HistoricalMarket):
+            state |= {"interval": m.interval, "first_open_time": m.candles[0][0], "candles": len(m.candles)}
         return state
+
+    @staticmethod
+    def _market_kind(m: object) -> str:
+        if isinstance(m, LiveMarketFeed):
+            return "live"
+        return "history" if isinstance(m, HistoricalMarket) else "simulator"
 
     def save_checkpoint(self) -> Path | None:
         """Ghi atomic trạng thái quần thể ra ``--checkpoint-file``. Lỗi ghi chỉ cảnh báo, không dừng mô phỏng."""
@@ -214,18 +257,21 @@ class Ecosystem:
         if not any(ag.is_alive for ag in agents):
             log.warning("⚠️  Quần thể trong checkpoint %s đã diệt vong — khởi tạo quần thể mới.", path)
             return False
+        m = self.market
+        same_kind = market.get("type", "simulator") == self._market_kind(m)
+        if isinstance(m, HistoricalMarket) and not self._resume_history(m, market, same_kind):
+            return False
 
         for name, target in (("ecosystem", self.rng), ("engine", self.engine.rng), ("genetics", self.genetics.rng)):
             target.setstate(restored[name].getstate())
-        m = self.market
-        m.tick = int(market["tick"])
-        same_kind = (market["type"] == "live") == isinstance(m, LiveMarketFeed)
-        if same_kind and not isinstance(m, LiveMarketFeed):
-            m.rng.setstate(restored["market"].getstate())
-            m.regime = market["regime"]
-            m.prices = [float(p) for p in market["prices"]]
-            m.returns = [float(r) for r in market["returns"]]
-        m._snapshot = m._build_snapshot()
+        if not isinstance(m, HistoricalMarket):
+            m.tick = int(market["tick"])
+            if same_kind and isinstance(m, MarketSimulator):
+                m.rng.setstate(restored["market"].getstate())
+                m.regime = market["regime"]
+                m.prices = [float(p) for p in market["prices"]]
+                m.returns = [float(r) for r in market["returns"]]
+            m._snapshot = m._build_snapshot()
         self.agents = [ag for ag in agents if ag.is_alive]
         self.graveyard = graveyard + [ag for ag in agents if not ag.is_alive]
         self._next_id = next_id
@@ -249,6 +295,19 @@ class Ecosystem:
         if not same_kind:
             log.warning("⚠️  Checkpoint dùng nguồn giá '%s', lần này nguồn giá khác — giữ chuỗi giá hiện tại.",
                         market["type"])
+        return True
+
+    @staticmethod
+    def _resume_history(m: HistoricalMarket, market: dict[str, Any], same_kind: bool) -> bool:
+        """Đưa chuỗi nến về đúng tick của checkpoint; khác chuỗi nến hoặc vượt quá độ dài thì khởi tạo mới."""
+        tick = int(market["tick"])
+        same_series = (same_kind and market.get("symbol") == m.symbol and market.get("interval") == m.interval
+                       and market.get("first_open_time") == m.candles[0][0])
+        if not same_series or tick > m.total_ticks:
+            log.warning("⚠️  Checkpoint không thuộc cùng chuỗi nến lịch sử %s %s (hoặc vượt quá %d nến) — "
+                        "khởi tạo quần thể mới.", m.symbol, m.interval, m.total_ticks)
+            return False
+        m.seek(tick)
         return True
 
     def _new_confluence_weight(self) -> float:
@@ -299,11 +358,18 @@ class Ecosystem:
 
     def run(self) -> int:
         a = self.args
+        steps = a.steps
+        if self.backtesting:
+            available = self.market.remaining()
+            steps = a.steps = available if steps is None else min(steps, available)
+            if steps <= 0:
+                log.warning("⚠️  Checkpoint đã ở nến lịch sử cuối cùng — không còn tick nào để chạy.")
+            self._record_equity(self.market.snapshot())
         mem = self.memory.summary()
         log.info(
             "🚀 Bắt đầu mô phỏng: %d bước, tick %.2fs, seed=%s, tối đa %d agent, nguồn giá: %s. Bộ nhớ: %s "
             "(%d quy tắc, %d cái chết đã biết)",
-            a.steps, a.tick, a.seed, a.max_agents,
+            steps, a.tick, a.seed, a.max_agents,
             self.price_source,
             a.memory, mem["quy_tac"], mem["cai_chet"],
         )
@@ -311,7 +377,7 @@ class Ecosystem:
             log.info("💾 Checkpoint: %s (mỗi %s tick và khi kết thúc/Ctrl+C)%s",
                      a.checkpoint_file, a.checkpoint_every or "—",
                      f", tiếp tục từ tick {self.start_tick}" if self.start_tick else "")
-        last = self.start_tick + a.steps
+        last = self.start_tick + steps
         dashboard = self._start_dashboard() if a.dashboard else None
         try:
             self._run_ticks(last, dashboard)
@@ -322,7 +388,22 @@ class Ecosystem:
             if dashboard is not None:
                 dashboard.stop()
         self._print_report(self.current_tick)
+        if self.backtesting:
+            summary = self.backtest_summary()
+            self._print_backtest(summary)
+            self._write_backtest_outputs(summary)
         return 0
+
+    @staticmethod
+    def _print_backtest(s: dict[str, Any]) -> None:
+        print(f" BACKTEST {s['cap']} {s['khung']} | {s['tu']} → {s['den']} UTC | {s['so_tick']} nến")
+        print(f"   Hệ sinh thái : ${s['von_dau']:.2f} → ${s['von_cuoi']:.2f} ({s['loi_nhuan']:+.2%}), "
+              f"Max DD {s['max_dd']:.1%}, sống {s['song']}, chết {s['chet']}"
+              + (f" (diệt vong ở tick {s['diet_vong_tai_tick']}, vốn còn lại giữ nguyên tới cuối giai đoạn)"
+                 if s["diet_vong_tai_tick"] is not None else ""))
+        print(f"   Buy & Hold   : ${s['von_dau']:.2f} → ${s['buy_hold_von_cuoi']:.2f} ({s['buy_hold_loi_nhuan']:+.2%}), "
+              f"Max DD {s['buy_hold_max_dd']:.1%} (giá {format_price(s['gia_dau'])} → {format_price(s['gia_cuoi'])})")
+        print("=" * 112)
 
     def _start_dashboard(self):
         """Bật dashboard rich; không được (chưa cài rich, không phải TTY) thì cảnh báo và chạy log thường."""
@@ -343,7 +424,8 @@ class Ecosystem:
                 break
             snap = self.market.step()
             if self.analysis_feed is not None:
-                self.analysis = self.analysis_feed.update(snap.tick, snap.price)
+                ohlc = self.market.current_candle[1:5] if isinstance(self.market, HistoricalMarket) else None
+                self.analysis = self.analysis_feed.update(snap.tick, snap.price, ohlc)
                 snap = replace(snap, confluence=self.analysis["confluence_score"])
             newborns = self._newborns = []
             for agent in list(self.agents):
@@ -359,6 +441,8 @@ class Ecosystem:
                 self.genetics.enforce_diversity(step)
 
             self.current_tick = step
+            if self.backtesting:
+                self._record_equity(snap)
             if step % a.summary_every == 0 or step == last:
                 self._print_status(step, snap)
             if a.checkpoint_every > 0 and step % a.checkpoint_every == 0 and self.agents:
@@ -369,9 +453,79 @@ class Ecosystem:
                 dashboard.update(step, snap, force=step == last or self._stop or not self.agents)
             if not self.agents:
                 log.warning("☠️  Toàn bộ hệ sinh thái đã diệt vong tại tick %d.", step)
+                if self.backtesting:
+                    self._extend_equity_after_extinction(last)
                 break
             if a.tick > 0 and not self._stop:
                 time.sleep(a.tick)
+
+    @property
+    def backtesting(self) -> bool:
+        return isinstance(self.market, HistoricalMarket)
+
+    def ecosystem_equity(self, snap) -> float:
+        """Tổng tài sản của mọi agent từng sinh ra: agent sống tính cả lãi/lỗ đang mở, agent chết giữ vốn còn lại."""
+        alive = sum(ag.total_assets(snap) for ag in self.agents)
+        return alive + sum(ag.capital for ag in self.graveyard)
+
+    def _record_equity(self, snap) -> None:
+        self.equity_curve.append((snap.tick, snap.price, self.ecosystem_equity(snap)))
+
+    def _extend_equity_after_extinction(self, last: int) -> None:
+        """Vốn còn lại đứng yên tới hết giai đoạn để so với Buy & Hold trên cùng khoảng thời gian."""
+        self.extinct_at = self.current_tick
+        frozen = self.equity_curve[-1][2]
+        for tick in range(self.current_tick + 1, last + 1):
+            self.equity_curve.append((tick, self.market.candle_at(tick)[4], frozen))
+
+    def backtest_summary(self) -> dict[str, Any]:
+        """Kết quả backtest so với mốc Buy & Hold cùng giai đoạn (cùng vốn ban đầu, cùng các tick)."""
+        m = self.market
+        ticks = [t for t, _, _ in self.equity_curve]
+        prices = [p for _, p, _ in self.equity_curve]
+        equity = [e for _, _, e in self.equity_curve]
+        hold = buy_and_hold(prices, equity[0])
+        return {
+            "cap": m.symbol,
+            "khung": m.interval,
+            "tu": ms_to_text(m.candle_at(max(ticks[0], 1))[0]),
+            "den": ms_to_text(m.candle_at(max(ticks[-1], 1))[0]),
+            "so_tick": ticks[-1] - ticks[0],
+            "seed": self.args.seed,
+            "phan_tich_da_khung": bool(self.args.advanced_analysis),
+            "tinh_hoa_theo": self.args.elite_fitness,
+            "von_dau": round(equity[0], 6),
+            "von_cuoi": round(equity[-1], 6),
+            "von_agent_song": round(sum(ag.capital for ag in self.agents), 6),
+            "loi_nhuan": round(equity[-1] / equity[0] - 1, 6),
+            "max_dd": round(max_drawdown(equity), 6),
+            "song": len(self.agents),
+            "chet": len(self.graveyard),
+            "the_he_cao_nhat": max((ag.generation for ag in self.agents), default=0),
+            "diet_vong_tai_tick": self.extinct_at,
+            "buy_hold_von_cuoi": round(hold["von_cuoi"], 6),
+            "buy_hold_loi_nhuan": round(hold["loi_nhuan"], 6),
+            "buy_hold_max_dd": round(hold["max_dd"], 6),
+            "gia_dau": prices[0],
+            "gia_cuoi": prices[-1],
+        }
+
+    def _write_backtest_outputs(self, summary: dict[str, Any]) -> None:
+        a = self.args
+        if a.equity_csv is not None:
+            a.equity_csv.parent.mkdir(parents=True, exist_ok=True)
+            start = self.equity_curve[0]
+            with a.equity_csv.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(("tick", "thoi_gian_utc", "gia", "von_he_sinh_thai", "von_buy_hold"))
+                for tick, price, equity in self.equity_curve:
+                    when = ms_to_text(self.market.candle_at(tick)[0]) if tick > 0 else "khởi động"
+                    writer.writerow((tick, when, price, round(equity, 6), round(start[2] * price / start[1], 6)))
+            log.info("📈 Đã ghi đường vốn vào %s", a.equity_csv)
+        if a.summary_json is not None:
+            a.summary_json.parent.mkdir(parents=True, exist_ok=True)
+            a.summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            log.info("🧾 Đã ghi tóm tắt backtest vào %s", a.summary_json)
 
     def _print_status(self, step: int, snap) -> None:
         total = sum(ag.total_assets(snap) for ag in self.agents)
@@ -441,7 +595,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Mô phỏng hệ sinh thái Autonomous Adaptive AI Agent (giao dịch giả lập).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--steps", type=int, default=500, help="Số bước (tick) mô phỏng")
+    p.add_argument("--steps", type=int, default=None,
+                   help=f"Số bước (tick) mô phỏng (mặc định {DEFAULT_STEPS}; với --backtest mặc định là toàn bộ số nến)")
     p.add_argument("--tick", type=float, default=None,
                    help=f"Số giây nghỉ giữa hai tick, 0 = nhanh nhất (mặc định {DEFAULT_TICK_SIMULATED} khi giả lập, "
                         f"{DEFAULT_TICK_LIVE} khi --live-price)")
@@ -466,7 +621,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--live-price", action="store_true",
                    help="Dùng giá thị trường thật từ Binance thay cho thị trường giả lập (lệnh vẫn là mô phỏng)")
     p.add_argument("--symbol", type=str, default="BTCUSDT",
-                   help="Cặp giao dịch khi bật --live-price (ví dụ: BTCUSDT, ETHUSDT)")
+                   help="Cặp giao dịch khi bật --live-price hoặc --backtest (ví dụ: BTCUSDT, ETHUSDT)")
     p.add_argument("--checkpoint-every", type=int, default=0,
                    help="Lưu checkpoint quần thể sau mỗi N tick, kèm một lần khi kết thúc/Ctrl+C (0 = tắt)")
     p.add_argument("--checkpoint-file", type=Path, default=DEFAULT_CHECKPOINT,
@@ -488,6 +643,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Khung nến Binance cho HTF khi dùng cùng --live-price")
     p.add_argument("--ltf-interval", type=str, default="1m",
                    help="Khung nến Binance cho LTF khi dùng cùng --live-price")
+    bt = p.add_argument_group("Backtest trên nến lịch sử thật")
+    bt.add_argument("--backtest", action="store_true",
+                    help="Chạy trên nến lịch sử thật của Binance: một nến = một tick, không nghỉ giữa tick, "
+                         "cache CSV trong --history-dir để lần sau chạy offline")
+    bt.add_argument("--interval", type=str, default="1h", help="Khung nến lịch sử (1m, 15m, 1h, 4h, 1d…)")
+    bt.add_argument("--start", type=str, default=None, help="Ngày bắt đầu YYYY-MM-DD (UTC)")
+    bt.add_argument("--end", type=str, default=None,
+                    help="Ngày kết thúc YYYY-MM-DD (UTC, tính cả ngày này; mặc định hôm qua)")
+    bt.add_argument("--days", type=int, default=None,
+                    help=f"Lấy N ngày gần nhất kết thúc ở --end (mặc định {DEFAULT_BACKTEST_DAYS} nếu không có --start)")
+    bt.add_argument("--history-file", type=Path, default=None,
+                    help="Dùng CSV nến có sẵn (open_time,open,high,low,close[,volume]; nhận cả CSV gốc của Binance)")
+    bt.add_argument("--history-dir", type=Path, default=DEFAULT_HISTORY_DIR, help="Thư mục cache nến lịch sử")
+    bt.add_argument("--equity-csv", type=Path, default=None,
+                    help="Ghi đường vốn hệ sinh thái và Buy & Hold theo từng tick ra CSV")
+    bt.add_argument("--summary-json", type=Path, default=None, help="Ghi tóm tắt kết quả backtest ra JSON")
     p.add_argument("--no-fsync", action="store_true", help="Bỏ fsync khi ghi (nhanh hơn, kém bền hơn)")
     verbosity = p.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true", help="In chi tiết từng lệnh/Post-Mortem")
@@ -500,9 +671,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if args.live_dashboard:
         args.live_price = args.dashboard = True
+    if args.backtest:
+        _resolve_backtest_args(p, args)
+    elif any(v is not None for v in (args.start, args.end, args.days, args.history_file, args.equity_csv,
+                                     args.summary_json)):
+        p.error("--start/--end/--days/--history-file/--equity-csv/--summary-json chỉ dùng cùng --backtest")
     if args.tick is None:
-        args.tick = DEFAULT_TICK_LIVE if args.live_price else DEFAULT_TICK_SIMULATED
-    if args.steps <= 0 or args.agents <= 0 or args.max_agents < args.agents or args.summary_every <= 0:
+        args.tick = 0.0 if args.backtest else DEFAULT_TICK_LIVE if args.live_price else DEFAULT_TICK_SIMULATED
+    if args.steps is None and not args.backtest:
+        args.steps = DEFAULT_STEPS
+    bad_steps = args.steps is not None and args.steps <= 0
+    if bad_steps or args.agents <= 0 or args.max_agents < args.agents or args.summary_every <= 0:
         p.error("Tham số không hợp lệ: cần steps > 0, agents > 0, summary-every > 0 và max-agents ≥ agents")
     if args.tick < 0:
         p.error("Tham số không hợp lệ: --tick phải ≥ 0")
@@ -522,11 +701,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _resolve_backtest_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Kiểm tra cờ backtest và quy đổi --start/--end/--days thành ngày cụ thể."""
+    if args.live_price:
+        p.error("--backtest không dùng cùng --live-price/--live-dashboard")
+    try:
+        interval_ms(args.interval)
+        end = parse_date(args.end) if args.end else datetime.now(timezone.utc).date() - timedelta(days=1)
+        start = parse_date(args.start) if args.start else None
+    except ValueError as e:
+        p.error(str(e))
+    if args.days is not None:
+        if args.days < 1:
+            p.error("--days phải ≥ 1")
+        if start is not None:
+            p.error("Chỉ dùng một trong --start hoặc --days")
+    if start is None:
+        start = end - timedelta(days=(args.days or DEFAULT_BACKTEST_DAYS) - 1)
+    if end < start:
+        p.error(f"--end ({end}) phải sau --start ({start})")
+    args.start, args.end = start, end
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     level = logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s %(name)-14s %(message)s", datefmt="%H:%M:%S")
-    eco = Ecosystem(args)
+    try:
+        eco = Ecosystem(args)
+    except HistoryUnavailable as e:
+        log.error("❌ Không backtest được: %s", e)
+        return 2
     previous = signal.signal(signal.SIGINT, eco.request_stop)
     try:
         return eco.run()

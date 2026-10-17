@@ -501,13 +501,15 @@ class CandleBuilder:
         self.current: list[float] | None = None
         self.count = 0
 
-    def add(self, tick: int, price: float) -> None:
+    def add(self, tick: int, price: float, ohlc: Sequence[float] | None = None) -> None:
+        """Thêm một tick; ``ohlc`` = (open, high, low, close) của nến thật thì gộp đúng biên độ của nến đó."""
+        o, h, l = (float(ohlc[0]), float(ohlc[1]), float(ohlc[2])) if ohlc is not None else (price, price, price)
         if self.current is None:
-            self.current = [float(tick), price, price, price, price, 0.0]
+            self.current = [float(tick), o, h, l, price, 0.0]
             self.count = 0
         c = self.current
-        c[2] = max(c[2], price)
-        c[3] = min(c[3], price)
+        c[2] = max(c[2], h)
+        c[3] = min(c[3], l)
         c[4] = price
         self.count += 1
         if self.count >= self.ticks_per_candle:
@@ -541,6 +543,8 @@ class ConfluenceFeed:
     * Mặc định dựng nến từ chuỗi giá tick: HTF = ``htf_ticks`` tick/nến, LTF = ``ltf_ticks`` tick/nến.
     * Nếu có ``fetch`` (chế độ giá thật), lấy nến Binance ``htf_interval``/``ltf_interval`` và làm mới
       sau mỗi ``refresh_htf``/``refresh_ltf`` tick; lấy lỗi thì dùng nến gom từ tick.
+    * Backtest truyền nến lịch sử thật qua ``ohlc``: HTF/LTF gộp ``htf_ticks``/``ltf_ticks`` nến đã đóng,
+      không bao giờ dùng nến sau tick hiện tại.
     """
 
     def __init__(
@@ -578,15 +582,19 @@ class ConfluenceFeed:
         self._remote.pop(key, None)
         return None
 
-    def update(self, tick: int, price: float) -> dict[str, Any]:
-        self.htf.add(tick, price)
-        self.ltf.add(tick, price)
+    def update(self, tick: int, price: float, ohlc: Sequence[float] | None = None) -> dict[str, Any]:
+        """``ohlc`` là nến lịch sử thật của tick này (backtest); chỉ nến đã đóng tới ``tick`` được dùng."""
+        self.htf.add(tick, price, ohlc)
+        self.ltf.add(tick, price, ohlc)
         htf = ltf = None
         if self.fetch is not None:
             htf = self._remote_klines("htf", tick, self.htf_interval, self.htf.max_candles, self.refresh_htf)
             ltf = self._remote_klines("ltf", tick, self.ltf_interval, self.ltf.max_candles, self.refresh_ltf)
         remote = htf is not None and ltf is not None
-        self.source = f"Binance {self.htf_interval}/{self.ltf_interval}" if remote else "nến gom từ tick"
+        if remote:
+            self.source = f"Binance {self.htf_interval}/{self.ltf_interval}"
+        else:
+            self.source = "nến lịch sử gộp" if ohlc is not None else "nến gom từ tick"
         if not remote:
             htf, ltf = self.htf.klines(), self.ltf.klines()
         result = self.analyzer.analyze_multi_timeframe(htf, ltf)

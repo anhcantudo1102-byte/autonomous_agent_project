@@ -80,6 +80,7 @@ TEN_CHE_DO = {
     "hon_loan": "Hỗn loạn",
     "thuc_te": "Giá thật",
     "gia_lap_du_phong": "Giả lập (API lỗi)",
+    "lich_su": "Lịch sử thật",
 }
 
 

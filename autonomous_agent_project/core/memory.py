@@ -148,9 +148,11 @@ class MemoryBank:
         max_failures: int = 300,
         max_deaths: int = 200,
         max_births: int = 500,
+        compact: bool = False,
     ) -> None:
         self.path = Path(path)
         self.durable = durable
+        self.compact = compact
         self.max_failures = max_failures
         self.max_deaths = max_deaths
         self.max_births = max_births
@@ -209,7 +211,11 @@ class MemoryBank:
         fd, tmp = tempfile.mkstemp(prefix=".memory_", suffix=".tmp", dir=self.path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=2)
+                if self.compact:
+                    # json.dumps không thụt lề mới dùng bộ mã hoá C; json.dump luôn dùng bản Python chậm.
+                    fh.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+                else:
+                    json.dump(data, fh, ensure_ascii=False, indent=2)
                 fh.flush()
                 if self.durable:
                     os.fsync(fh.fileno())
